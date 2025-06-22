@@ -1,0 +1,83 @@
+# Kubernetes-focused chaos engineering configuration
+k8s:
+  kubeconfig: ~/.kube/config
+  context: default
+  namespaces:
+    - default
+    - sock-shop
+    - monitoring
+  
+  # Chaos engineering tools configuration
+  chaos_tools:
+    litmuschaos:
+      enabled: true
+      namespace: litmus
+      operator_version: "2.14.0"
+    
+    chaos_mesh:
+      enabled: false
+      namespace: chaos-testing
+  
+  # Monitoring configuration
+  monitoring:
+    prometheus:
+      url: http://prometheus.kube-system.svc.cluster.local:9090
+      namespace: monitoring
+    
+    grafana:
+      url: http://grafana.kube-system.svc.cluster.local:3000
+      namespace: monitoring
+  
+  # Application services to target
+  target_services:
+    - name: frontend
+      namespace: sock-shop
+      type: deployment
+      replicas: 2
+      critical: true
+    
+    - name: catalogue
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+    
+    - name: cart
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+    
+    - name: redis
+      namespace: sock-shop
+      type: statefulset
+      replicas: 1
+      critical: true
+    
+    - name: mysql
+      namespace: sock-shop
+      type: statefulset
+      replicas: 1
+      critical: true
+
+# Slack integration
+slack:
+  channel: sre-chaos
+  bot_token: ${SLACK_BOT_TOKEN}
+  signing_secret: ${SLACK_SIGNING_SECRET}
+
+# Experiment settings
+experiments:
+  default_duration: "60s"
+  max_duration: "300s"
+  abort_thresholds:
+    error_rate: 0.05  # 5% error rate
+    latency_p95: 2.0  # 2x baseline latency
+    cpu_usage: 0.9    # 90% CPU usage
+    memory_usage: 0.9 # 90% memory usage
+
+# Output configuration
+output:
+  experiments_dir: experiments/
+  reports_dir: reports/
+  artifacts_dir: artifacts/ 
