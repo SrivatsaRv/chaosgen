@@ -1,9 +1,8 @@
-# Kubernetes-focused chaos engineering configuration
+# Kubernetes-focused chaos engineering configuration for Sock Shop
 k8s:
   kubeconfig: ~/.kube/config
   context: default
   namespaces:
-    - default
     - sock-shop
     - monitoring
   
@@ -28,37 +27,196 @@ k8s:
       url: http://grafana.kube-system.svc.cluster.local:3000
       namespace: monitoring
   
-  # Application services to target
+  # Sock Shop Application Services - Complete Architecture
   target_services:
-    - name: frontend
+    # Frontend Layer
+    - name: front-end
       namespace: sock-shop
       type: deployment
       replicas: 2
       critical: true
+      labels:
+        app: front-end
+        tier: frontend
+      ports:
+        - port: 80
+          targetPort: 8079
+      dependencies: ["catalogue", "carts", "orders", "user", "payment"]
     
+    # API Gateway
+    - name: edge-router
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+      labels:
+        app: edge-router
+        tier: gateway
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["front-end"]
+    
+    # Core Business Services
     - name: catalogue
       namespace: sock-shop
       type: deployment
-      replicas: 1
+      replicas: 2
       critical: true
+      labels:
+        app: catalogue
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["catalogue-db"]
     
-    - name: cart
+    - name: carts
+      namespace: sock-shop
+      type: deployment
+      replicas: 2
+      critical: true
+      labels:
+        app: carts
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["carts-db"]
+    
+    - name: orders
+      namespace: sock-shop
+      type: deployment
+      replicas: 2
+      critical: true
+      labels:
+        app: orders
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["orders-db", "payment", "shipping"]
+    
+    - name: user
       namespace: sock-shop
       type: deployment
       replicas: 1
       critical: true
+      labels:
+        app: user
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["user-db"]
     
-    - name: redis
+    - name: payment
       namespace: sock-shop
-      type: statefulset
+      type: deployment
       replicas: 1
       critical: true
+      labels:
+        app: payment
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: []
     
-    - name: mysql
+    - name: shipping
       namespace: sock-shop
-      type: statefulset
+      type: deployment
+      replicas: 1
+      critical: false
+      labels:
+        app: shipping
+        tier: backend
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: []
+    
+    # Data Layer
+    - name: catalogue-db
+      namespace: sock-shop
+      type: deployment
       replicas: 1
       critical: true
+      labels:
+        app: catalogue-db
+        tier: database
+      ports:
+        - port: 27017
+          targetPort: 27017
+      dependencies: []
+    
+    - name: carts-db
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+      labels:
+        app: carts-db
+        tier: database
+      ports:
+        - port: 6379
+          targetPort: 6379
+      dependencies: []
+    
+    - name: orders-db
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+      labels:
+        app: orders-db
+        tier: database
+      ports:
+        - port: 27017
+          targetPort: 27017
+      dependencies: []
+    
+    - name: user-db
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: true
+      labels:
+        app: user-db
+        tier: database
+      ports:
+        - port: 27017
+          targetPort: 27017
+      dependencies: []
+    
+    # Queue System
+    - name: queue-master
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: false
+      labels:
+        app: queue-master
+        tier: queue
+      ports:
+        - port: 80
+          targetPort: 8080
+      dependencies: ["rabbitmq"]
+    
+    - name: rabbitmq
+      namespace: sock-shop
+      type: deployment
+      replicas: 1
+      critical: false
+      labels:
+        app: rabbitmq
+        tier: queue
+      ports:
+        - port: 5672
+          targetPort: 5672
+        - port: 15672
+          targetPort: 15672
+      dependencies: []
 
 # Slack integration
 slack:
@@ -66,15 +224,36 @@ slack:
   bot_token: ${SLACK_BOT_TOKEN}
   signing_secret: ${SLACK_SIGNING_SECRET}
 
-# Experiment settings
+# Experiment settings optimized for Sock Shop
 experiments:
   default_duration: "60s"
   max_duration: "300s"
+  
+  # Sock Shop specific abort thresholds
   abort_thresholds:
-    error_rate: 0.05  # 5% error rate
-    latency_p95: 2.0  # 2x baseline latency
-    cpu_usage: 0.9    # 90% CPU usage
-    memory_usage: 0.9 # 90% memory usage
+    error_rate: 0.05      # 5% error rate
+    latency_p95: 2.0      # 2x baseline latency
+    cpu_usage: 0.9        # 90% CPU usage
+    memory_usage: 0.9     # 90% memory usage
+    response_time: 5.0    # 5 second response time
+  
+  # Service-specific experiment preferences
+  service_preferences:
+    frontend:
+      preferred_actions: ["pod-kill", "pod-cpu-hog", "network-latency"]
+      risk_level: "medium"
+    
+    backend:
+      preferred_actions: ["pod-kill", "pod-memory-hog", "network-partition"]
+      risk_level: "high"
+    
+    database:
+      preferred_actions: ["pod-kill", "disk-fill", "network-latency"]
+      risk_level: "critical"
+    
+    queue:
+      preferred_actions: ["pod-kill", "network-partition"]
+      risk_level: "medium"
 
 # Output configuration
 output:

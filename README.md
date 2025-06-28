@@ -1,34 +1,67 @@
-# Chaos Advisor Agent
+# Chaos Advisor Agent for Sock Shop
 
-An AI-powered chaos engineering advisor that works exclusively with Kubernetes environments. The agent discovers your infrastructure, generates context-aware chaos experiments using LLM, executes them via LitmusChaos, monitors execution in real-time, and auto-generates comprehensive RCA reports.
+An AI-powered chaos engineering advisor specifically configured for the Sock Shop microservices application. The agent discovers your Sock Shop infrastructure, generates context-aware chaos experiments using LLM, executes them via LitmusChaos, monitors execution in real-time, and auto-generates comprehensive RCA reports.
 
 ## 🚀 Features
 
-- **Kubernetes-Native**: Built specifically for K8s environments with LitmusChaos integration
+- **Sock Shop Optimized**: Pre-configured for the complete Sock Shop microservices architecture
 - **AI-Powered Experiment Design**: Uses GPT-4o to generate context-aware chaos experiments
-- **Infrastructure Discovery**: Automatically discovers Deployments, StatefulSets, Services, and their relationships
+- **Infrastructure Discovery**: Automatically discovers all Sock Shop services (frontend, backend, databases, queues)
 - **Real-Time Monitoring**: Tracks metrics via Prometheus with configurable abort thresholds
 - **Automated RCA Generation**: Creates comprehensive reports with Mermaid diagrams and LLM insights
 - **Slack Integration**: Interactive workflow with real-time updates and one-click execution
 - **Safety First**: Dry-run validation, abort conditions, and risk assessment
 
-## 🏗️ Architecture
+## 🏗️ Sock Shop Architecture
+
+The agent is configured for the complete Sock Shop microservices stack:
+
+```
+┌─ Frontend Layer ──────────────────────────────────┐
+│ • front-end (React UI)                            │
+│ • edge-router (API Gateway)                       │
+└───────────────────────────────────────────────────┘
+                          │
+┌─ Core Business Services ──────────────────────────┐
+│ • catalogue (Product catalog)                     │
+│ • carts (Shopping cart management)                │
+│ • orders (Order processing)                       │
+│ • user (User management)                          │
+│ • payment (Payment processing)                    │
+│ • shipping (Shipping calculation)                 │
+└───────────────────────────────────────────────────┘
+                          │
+┌─ Data Layer ──────────────────────────────────────┐
+│ • catalogue-db (MongoDB)                          │
+│ • carts-db (Redis)                                │
+│ • orders-db (MongoDB)                             │
+│ • user-db (MongoDB)                               │
+└───────────────────────────────────────────────────┘
+                          │
+┌─ Queue System ────────────────────────────────────┐
+│ • queue-master (Order queue management)           │
+│ • rabbitmq (Message broker)                       │
+└───────────────────────────────────────────────────┘
+```
+
+## 🔄 Workflow
 
 ```
 ┌─ Engineer runs /craterctl suggest
 │
-├─ Agent discovers K8s stack via stack.yaml
-│   • finds deployments, statefulsets, services
-│   • extracts resource requirements and relationships
+├─ Agent discovers Sock Shop stack via stack.yaml
+│   • finds all 13 microservices across 4 tiers
+│   • extracts resource requirements and dependencies
 │
 ├─ Agent asks LLM for top experiments → ranks by impact
-│   • generates spec: "kill redis primary 30s" (pod-kill)
-│   • generates spec: "add 200ms net-delay to frontend" (network-delay)
+│   • generates spec: "kill carts-db pod 30s" (pod-kill)
+│   • generates spec: "add 200ms net-delay to front-end" (network-delay)
+│   • generates spec: "CPU hog on orders service" (pod-cpu-hog)
 │
 ├─ Slack bot posts interactive message
-│   [Run Redis Kill]   [Run Net-Delay]   [Save Only]
+│   [Run Carts DB Kill]   [Run Net-Delay]   [Save Only]
 │
-├─ Engineer clicks Run Redis Kill
+├─ Engineer clicks Run Carts DB Kill
 │   • executor_adapter applies LitmusChaos ChaosEngine (dry-run → live)
 │   • run_monitor_tool streams Prometheus metrics; slack updates every 30s
 │
@@ -36,11 +69,11 @@ An AI-powered chaos engineering advisor that works exclusively with Kubernetes e
 │   • automatically aborted if error_rate > 5%
 │
 ├─ post_run_narrator compiles logs & metrics
-│   • generates reports/2025-01-22_redis_kill.md
+│   • generates reports/2025-01-22_carts_db_kill.md
 │   • creates Mermaid sequence diagrams
 │
 └─ Slack bot posts TL;DR + report link
-    "Finding: redis failover took 1270 ms, caused 5% 500s in cart-svc. see report ➜"
+    "Finding: carts-db failover took 1270 ms, caused 5% 500s in carts-svc. see report ➜"
 ```
 
 ## 📋 Prerequisites

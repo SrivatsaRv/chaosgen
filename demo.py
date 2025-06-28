@@ -76,29 +76,149 @@ def demo_inventory_fetch():
         # Return mock topology for demo
         return {
             "services": [
+                # Frontend Layer
                 {
-                    "id": "sock-shop/frontend",
-                    "name": "frontend",
+                    "id": "sock-shop/front-end",
+                    "name": "front-end",
                     "namespace": "sock-shop",
                     "type": "deployment",
                     "env": "k8s",
-                    "critical": True
+                    "critical": True,
+                    "labels": {"app": "front-end", "tier": "frontend"},
+                    "replicas": 2
                 },
                 {
-                    "id": "sock-shop/redis",
-                    "name": "redis",
-                    "namespace": "sock-shop",
-                    "type": "statefulset",
-                    "env": "k8s",
-                    "critical": True
-                },
-                {
-                    "id": "sock-shop/cart",
-                    "name": "cart",
+                    "id": "sock-shop/edge-router",
+                    "name": "edge-router",
                     "namespace": "sock-shop",
                     "type": "deployment",
                     "env": "k8s",
-                    "critical": True
+                    "critical": True,
+                    "labels": {"app": "edge-router", "tier": "gateway"},
+                    "replicas": 1
+                },
+                # Core Business Services
+                {
+                    "id": "sock-shop/catalogue",
+                    "name": "catalogue",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "catalogue", "tier": "backend"},
+                    "replicas": 2
+                },
+                {
+                    "id": "sock-shop/carts",
+                    "name": "carts",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "carts", "tier": "backend"},
+                    "replicas": 2
+                },
+                {
+                    "id": "sock-shop/orders",
+                    "name": "orders",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "orders", "tier": "backend"},
+                    "replicas": 2
+                },
+                {
+                    "id": "sock-shop/user",
+                    "name": "user",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "user", "tier": "backend"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/payment",
+                    "name": "payment",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "payment", "tier": "backend"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/shipping",
+                    "name": "shipping",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": False,
+                    "labels": {"app": "shipping", "tier": "backend"},
+                    "replicas": 1
+                },
+                # Data Layer
+                {
+                    "id": "sock-shop/catalogue-db",
+                    "name": "catalogue-db",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "catalogue-db", "tier": "database"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/carts-db",
+                    "name": "carts-db",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "carts-db", "tier": "database"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/orders-db",
+                    "name": "orders-db",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "orders-db", "tier": "database"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/user-db",
+                    "name": "user-db",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": True,
+                    "labels": {"app": "user-db", "tier": "database"},
+                    "replicas": 1
+                },
+                # Queue System
+                {
+                    "id": "sock-shop/queue-master",
+                    "name": "queue-master",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": False,
+                    "labels": {"app": "queue-master", "tier": "queue"},
+                    "replicas": 1
+                },
+                {
+                    "id": "sock-shop/rabbitmq",
+                    "name": "rabbitmq",
+                    "namespace": "sock-shop",
+                    "type": "deployment",
+                    "env": "k8s",
+                    "critical": False,
+                    "labels": {"app": "rabbitmq", "tier": "queue"},
+                    "replicas": 1
                 }
             ],
             "metadata": {
@@ -156,18 +276,18 @@ def demo_experiment_design(topology):
         # Return mock experiments
         return [
             {
-                "title": "Redis Pod Kill",
-                "description": "Test Redis failover mechanism",
+                "title": "Carts Database Pod Kill",
+                "description": "Test carts database failover mechanism and cart service resilience",
                 "action": "pod-kill",
                 "target_selector": {
                     "namespace": "sock-shop",
-                    "label_selector": "app=redis"
+                    "label_selector": "app=carts-db"
                 },
                 "parameters": {
                     "duration": "60s",
                     "intensity": 0.5
                 },
-                "risk_level": "medium"
+                "risk_level": "high"
             }
         ]
 
