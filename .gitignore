@@ -31,11 +31,13 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+chaosgen-venv/
 
 # Environment variables
 .env.local
 .env.production
 .env.development
+.env
 
 # IDE
 .vscode/
@@ -70,6 +72,16 @@ artifacts/
 # Kubernetes
 kubeconfig
 *.kubeconfig
+k8s/generated/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraformrc
+terraform.rc
+.terraform.lock.hcl
 
 # Secrets
 secrets/
@@ -99,3 +111,7 @@ dmypy.json
 
 # Docker
 .dockerignore
+
+# Local development
+local/
+*.local
