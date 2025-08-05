@@ -1,0 +1,22 @@
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: mongo-pod-delete
+  namespace: litmus
+spec:
+  appinfo:
+    appns: litmus
+    applabel: "app=mongo"
+    appkind: statefulset
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "45"
+        - name: CHAOS_INTERVAL
+          value: "15"
+        - name: FORCE
+          value: "false"

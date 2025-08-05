@@ -1,0 +1,405 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: litmus
+---
+# LitmusChaos Operator
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-operator-ce
+  namespace: litmus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: chaos-operator-ce
+  template:
+    metadata:
+      labels:
+        name: chaos-operator-ce
+    spec:
+      serviceAccountName: litmus-admin
+      containers:
+      - name: chaos-operator-ce
+        image: litmuschaos/chaos-operator:3.10.0
+        command:
+        - chaos-operator
+        imagePullPolicy: Always
+        env:
+        - name: CHAOS_RUNNER_IMAGE
+          value: "litmuschaos/chaos-runner:3.10.0"
+        - name: WATCH_NAMESPACE
+          value: ""
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPERATOR_NAME
+          value: "chaos-operator-ce"
+---
+# Service Account for LitmusChaos
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-admin
+  namespace: litmus
+---
+# Cluster Role for LitmusChaos
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: litmus-admin
+rules:
+- apiGroups: [""]
+  resources: ["pods", "events", "configmaps", "secrets", "services", "persistentvolumeclaims", "persistentvolumes"]
+  verbs: ["create", "list", "get", "patch", "update", "delete", "deletecollection"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+  verbs: ["create", "list", "get", "patch", "update", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "list", "get", "patch", "update", "delete"]
+- apiGroups: ["litmuschaos.io"]
+  resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+  verbs: ["create", "list", "get", "patch", "update", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["create", "list", "get", "patch", "update", "delete"]
+---
+# Cluster Role Binding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-admin
+  namespace: litmus
+---
+# Service Account for demo namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litmus-admin
+  namespace: demo
+---
+# Role Binding for demo namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litmus-admin-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: litmus-admin
+subjects:
+- kind: ServiceAccount
+  name: litmus-admin
+  namespace: demo
+---
+# CRDs for LitmusChaos
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chaosengines.litmuschaos.io
+spec:
+  group: litmuschaos.io
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              appinfo:
+                type: object
+                properties:
+                  appns:
+                    type: string
+                  applabel:
+                    type: string
+                  appkind:
+                    type: string
+              chaosServiceAccount:
+                type: string
+              experiments:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    spec:
+                      type: object
+                      properties:
+                        components:
+                          type: object
+                          properties:
+                            env:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  name:
+                                    type: string
+                                  value:
+                                    type: string
+          status:
+            type: object
+  scope: Namespaced
+  names:
+    plural: chaosengines
+    singular: chaosengine
+    kind: ChaosEngine
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chaosexperiments.litmuschaos.io
+spec:
+  group: litmuschaos.io
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+          status:
+            type: object
+  scope: Namespaced
+  names:
+    plural: chaosexperiments
+    singular: chaosexperiment
+    kind: ChaosExperiment
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chaosresults.litmuschaos.io
+spec:
+  group: litmuschaos.io
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+          status:
+            type: object
+  scope: Namespaced
+  names:
+    plural: chaosresults
+    singular: chaosresult
+    kind: ChaosResult
+---
+# Common Chaos Experiments
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: pod-delete
+  namespace: demo
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create","delete","get","list","patch","update","deletecollection"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create","get","list","patch","update"]
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["get","list"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get","list","watch"]
+    - apiGroups: [""]
+      resources: ["pods/exec"]
+      verbs: ["get","list","create"]
+    - apiGroups: ["apps"]
+      resources: ["deployments","statefulsets","replicasets","daemonsets"]
+      verbs: ["list","get"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create","list","get","delete","deletecollection"]
+    - apiGroups: ["litmuschaos.io"]
+      resources: ["chaosengines","chaosexperiments","chaosresults"]
+      verbs: ["create","list","get","patch","update","delete"]
+    image: "litmuschaos/go-runner:3.10.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name pod-delete
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: '15'
+    - name: RAMP_TIME
+      value: ''
+    - name: FORCE
+      value: 'true'
+    - name: CHAOS_INTERVAL
+      value: '5'
+    - name: PODS_AFFECTED_PERC
+      value: ''
+    - name: TARGET_CONTAINER
+      value: ''
+    - name: TARGET_PODS
+      value: ''
+    - name: DEFAULT_HEALTH_CHECK
+      value: 'false'
+    - name: NODE_LABEL
+      value: ''
+    - name: SEQUENCE
+      value: 'parallel'
+    labels:
+      name: pod-delete
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: chaosexperiment
+      app.kubernetes.io/version: 3.10.0
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: pod-cpu-hog
+  namespace: demo
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create","delete","get","list","patch","update","deletecollection"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create","get","list","patch","update"]
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["get","list"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get","list","watch"]
+    - apiGroups: [""]
+      resources: ["pods/exec"]
+      verbs: ["get","list","create"]
+    - apiGroups: ["apps"]
+      resources: ["deployments","statefulsets","replicasets","daemonsets"]
+      verbs: ["list","get"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create","list","get","delete","deletecollection"]
+    - apiGroups: ["litmuschaos.io"]
+      resources: ["chaosengines","chaosexperiments","chaosresults"]
+      verbs: ["create","list","get","patch","update","delete"]
+    image: "litmuschaos/go-runner:3.10.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name pod-cpu-hog
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: '60'
+    - name: CPU_CORES
+      value: '1'
+    - name: PODS_AFFECTED_PERC
+      value: ''
+    - name: RAMP_TIME
+      value: ''
+    - name: TARGET_CONTAINER
+      value: ''
+    - name: TARGET_PODS
+      value: ''
+    - name: DEFAULT_HEALTH_CHECK
+      value: 'false'
+    - name: NODE_LABEL
+      value: ''
+    labels:
+      name: pod-cpu-hog
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: chaosexperiment
+      app.kubernetes.io/version: 3.10.0
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: pod-memory-hog
+  namespace: demo
+spec:
+  definition:
+    scope: Namespaced
+    permissions:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create","delete","get","list","patch","update","deletecollection"]
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create","get","list","patch","update"]
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      verbs: ["get","list"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get","list","watch"]
+    - apiGroups: [""]
+      resources: ["pods/exec"]
+      verbs: ["get","list","create"]
+    - apiGroups: ["apps"]
+      resources: ["deployments","statefulsets","replicasets","daemonsets"]
+      verbs: ["list","get"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create","list","get","delete","deletecollection"]
+    - apiGroups: ["litmuschaos.io"]
+      resources: ["chaosengines","chaosexperiments","chaosresults"]
+      verbs: ["create","list","get","patch","update","delete"]
+    image: "litmuschaos/go-runner:3.10.0"
+    imagePullPolicy: Always
+    args:
+    - -c
+    - ./experiments -name pod-memory-hog
+    command:
+    - /bin/bash
+    env:
+    - name: TOTAL_CHAOS_DURATION
+      value: '60'
+    - name: MEMORY_CONSUMPTION
+      value: '500'
+    - name: PODS_AFFECTED_PERC
+      value: ''
+    - name: RAMP_TIME
+      value: ''
+    - name: TARGET_CONTAINER
+      value: ''
+    - name: TARGET_PODS
+      value: ''
+    - name: DEFAULT_HEALTH_CHECK
+      value: 'false'
+    - name: NODE_LABEL
+      value: ''
+    labels:
+      name: pod-memory-hog
+      app.kubernetes.io/part-of: litmus
+      app.kubernetes.io/component: chaosexperiment
+      app.kubernetes.io/version: 3.10.0

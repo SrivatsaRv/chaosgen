@@ -1,13 +1,8 @@
 ---
-# Monitoring Stack for Chaos Engineering
-# Prometheus and Grafana setup for Sock Shop monitoring
-
 apiVersion: v1
 kind: Namespace
 metadata:
   name: monitoring
-  labels:
-    name: monitoring
 ---
 # Prometheus ConfigMap
 apiVersion: v1
@@ -22,10 +17,13 @@ data:
       evaluation_interval: 15s
 
     rule_files:
-      # - "first_rules.yml"
-      # - "second_rules.yml"
+      - "chaos_rules.yml"
 
     scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
       - job_name: 'kubernetes-pods'
         kubernetes_sd_configs:
           - role: pod
@@ -51,55 +49,22 @@ data:
             action: replace
             target_label: kubernetes_pod_name
 
-      - job_name: 'sock-shop-services'
-        static_configs:
-          - targets: ['front-end.sock-shop.svc.cluster.local:80', 'catalogue.sock-shop.svc.cluster.local:80', 'carts.sock-shop.svc.cluster.local:80', 'orders.sock-shop.svc.cluster.local:80', 'user.sock-shop.svc.cluster.local:80', 'payment.sock-shop.svc.cluster.local:80', 'shipping.sock-shop.svc.cluster.local:80']
-        metrics_path: /metrics
-        scrape_interval: 10s
-
-      - job_name: 'kubernetes-apiservers'
+      - job_name: 'kubernetes-services'
         kubernetes_sd_configs:
-          - role: endpoints
-        scheme: https
-        tls_config:
-          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
-            action: keep
-            regex: default;kubernetes;https
-
-      - job_name: 'kubernetes-nodes'
-        kubernetes_sd_configs:
-          - role: node
-        scheme: https
-        tls_config:
-          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-        relabel_configs:
-          - action: labelmap
-            regex: __meta_kubernetes_node_label_(.+)
-
-      - job_name: 'kubernetes-service-endpoints'
-        kubernetes_sd_configs:
-          - role: endpoints
+          - role: service
         relabel_configs:
           - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
             action: keep
             regex: true
-          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
-            action: replace
-            target_label: __scheme__
-            regex: (https?)
           - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
             action: replace
             target_label: __metrics_path__
             regex: (.+)
           - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
             action: replace
-            target_label: __address__
             regex: ([^:]+)(?::\d+)?;(\d+)
             replacement: $1:$2
+            target_label: __address__
           - action: labelmap
             regex: __meta_kubernetes_service_label_(.+)
           - source_labels: [__meta_kubernetes_namespace]
@@ -107,7 +72,53 @@ data:
             target_label: kubernetes_namespace
           - source_labels: [__meta_kubernetes_service_name]
             action: replace
-            target_label: kubernetes_name
+            target_label: kubernetes_service_name
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+              - alertmanager:9093
+
+  chaos_rules.yml: |
+    groups:
+    - name: chaos_engineering
+      rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is above 5% for {{ $labels.job }}"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency detected"
+          description: "95th percentile latency is above 500ms for {{ $labels.job }}"
+
+      - alert: PodRestartHigh
+        expr: increase(kube_pod_container_status_restarts_total[1h]) > 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod restarting frequently"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has restarted {{ $value }} times in the last hour"
+
+      - alert: ChaosExperimentFailed
+        expr: kube_job_status_failed{job_name=~"chaos-.*"} > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chaos experiment failed"
+          description: "Chaos experiment {{ $labels.job_name }} has failed"
 ---
 # Prometheus Deployment
 apiVersion: apps/v1
@@ -130,33 +141,34 @@ spec:
       serviceAccountName: prometheus
       containers:
       - name: prometheus
-        image: prom/prometheus:latest
+        image: prom/prometheus:v2.45.0
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus/'
+          - '--web.console.libraries=/etc/prometheus/console_libraries'
+          - '--web.console.templates=/etc/prometheus/consoles'
+          - '--storage.tsdb.retention.time=200h'
+          - '--web.enable-lifecycle'
         ports:
         - containerPort: 9090
-        volumeMounts:
-        - name: config
-          mountPath: /etc/prometheus
-        - name: storage
-          mountPath: /prometheus
-        args:
-        - '--config.file=/etc/prometheus/prometheus.yml'
-        - '--storage.tsdb.path=/prometheus'
-        - '--web.console.libraries=/etc/prometheus/console_libraries'
-        - '--web.console.templates=/etc/prometheus/consoles'
-        - '--storage.tsdb.retention.time=200h'
-        - '--web.enable-lifecycle'
         resources:
-          limits:
-            cpu: "500m"
-            memory: "1Gi"
           requests:
-            cpu: "250m"
-            memory: "500Mi"
+            memory: "400Mi"
+            cpu: "100m"
+          limits:
+            memory: "800Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: prometheus-config-volume
+          mountPath: /etc/prometheus/
+        - name: prometheus-storage-volume
+          mountPath: /prometheus/
       volumes:
-      - name: config
+      - name: prometheus-config-volume
         configMap:
+          defaultMode: 420
           name: prometheus-config
-      - name: storage
+      - name: prometheus-storage-volume
         emptyDir: {}
 ---
 # Prometheus Service
@@ -168,13 +180,12 @@ metadata:
   labels:
     app: prometheus
 spec:
-  type: ClusterIP
+  selector:
+    app: prometheus
+  type: LoadBalancer
   ports:
   - port: 9090
     targetPort: 9090
-    protocol: TCP
-  selector:
-    app: prometheus
 ---
 # Prometheus ServiceAccount
 apiVersion: v1
@@ -219,87 +230,75 @@ subjects:
   name: prometheus
   namespace: monitoring
 ---
-# Grafana ConfigMap
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: grafana-datasources
-  namespace: monitoring
-data:
-  prometheus.yaml: |-
-    {
-      "apiVersion": 1,
-      "datasources": [
-        {
-          "name": "Prometheus",
-          "type": "prometheus",
-          "url": "http://prometheus:9090",
-          "access": "proxy",
-          "isDefault": true
-        }
-      ]
-    }
----
-# Grafana Deployment
+# Node Exporter DaemonSet
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
-  name: grafana
+  name: node-exporter
   namespace: monitoring
   labels:
-    app: grafana
+    app: node-exporter
 spec:
-  replicas: 1
   selector:
     matchLabels:
-      app: grafana
+      app: node-exporter
   template:
     metadata:
       labels:
-        app: grafana
+        app: node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
     spec:
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
       containers:
-      - name: grafana
-        image: grafana/grafana:latest
+      - name: node-exporter
+        image: prom/node-exporter:v1.6.0
         ports:
-        - containerPort: 3000
-        env:
-        - name: GF_SECURITY_ADMIN_PASSWORD
-          value: "admin"
-        - name: GF_USERS_ALLOW_SIGN_UP
-          value: "false"
-        volumeMounts:
-        - name: grafana-storage
-          mountPath: /var/lib/grafana
-        - name: grafana-datasources
-          mountPath: /etc/grafana/provisioning/datasources
+        - containerPort: 9100
         resources:
-          limits:
-            cpu: "500m"
-            memory: "1Gi"
           requests:
-            cpu: "250m"
-            memory: "500Mi"
+            memory: "30Mi"
+            cpu: "10m"
+          limits:
+            memory: "50Mi"
+            cpu: "20m"
+        args:
+          - --path.procfs=/host/proc
+          - --path.sysfs=/host/sys
+          - --collector.filesystem.ignored-mount-points
+          - ^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly:  true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
       volumes:
-      - name: grafana-storage
-        emptyDir: {}
-      - name: grafana-datasources
-        configMap:
-          name: grafana-datasources
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
 ---
-# Grafana Service
+# Node Exporter Service
 apiVersion: v1
 kind: Service
 metadata:
-  name: grafana
+  name: node-exporter
   namespace: monitoring
   labels:
-    app: grafana
+    app: node-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9100"
 spec:
-  type: LoadBalancer
-  ports:
-  - port: 80
-    targetPort: 3000
-    protocol: TCP
   selector:
-    app: grafana 
+    app: node-exporter
+  ports:
+  - port: 9100
+    targetPort: 9100

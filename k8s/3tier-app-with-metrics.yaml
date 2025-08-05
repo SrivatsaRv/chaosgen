@@ -1,0 +1,242 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config-metrics
+  namespace: demo
+data:
+  app.py: |
+    from flask import Flask, jsonify, request
+    import psycopg2
+    import os
+    import time
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+    app = Flask(__name__)
+    logging.basicConfig(level=logging.INFO)
+
+    # Prometheus metrics
+    REQUEST_COUNT = Counter('flask_http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
+    REQUEST_DURATION = Histogram('flask_http_request_duration_seconds', 'HTTP request duration')
+    DB_CONNECTIONS = Gauge('database_connections_active', 'Active database connections')
+    DB_QUERY_DURATION = Histogram('database_query_duration_seconds', 'Database query duration')
+    ERROR_COUNT = Counter('flask_http_request_exceptions_total', 'Total HTTP request exceptions')
+
+    # Database connection
+    def get_db_connection():
+        try:
+            conn = psycopg2.connect(
+                host=os.getenv('DB_HOST', 'database'),
+                database=os.getenv('DB_NAME', 'demoapp'),
+                user=os.getenv('DB_USER', 'demouser'),
+                password=os.getenv('DB_PASSWORD', 'demopass')
+            )
+            DB_CONNECTIONS.inc()
+            return conn
+        except Exception as e:
+            app.logger.error(f"Database connection failed: {e}")
+            ERROR_COUNT.inc()
+            return None
+
+    def close_db_connection(conn):
+        if conn:
+            conn.close()
+            DB_CONNECTIONS.dec()
+
+    # Initialize database
+    def init_db():
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(100) NOT NULL,
+                        email VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                # Insert sample data
+                cur.execute('''
+                    INSERT INTO users (name, email) VALUES 
+                    ('Alice Johnson', 'alice@demo.com'),
+                    ('Bob Smith', 'bob@demo.com'),
+                    ('Carol Davis', 'carol@demo.com')
+                    ON CONFLICT DO NOTHING
+                ''')
+                conn.commit()
+                cur.close()
+                close_db_connection(conn)
+                app.logger.info("Database initialized successfully")
+            except Exception as e:
+                app.logger.error(f"Database initialization failed: {e}")
+                ERROR_COUNT.inc()
+                close_db_connection(conn)
+
+    @app.before_request
+    def before_request():
+        request.start_time = time.time()
+
+    @app.after_request
+    def after_request(response):
+        request_duration = time.time() - request.start_time
+        REQUEST_DURATION.observe(request_duration)
+        REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=request.endpoint or 'unknown',
+            status=response.status_code
+        ).inc()
+        return response
+
+    @app.route('/metrics')
+    def metrics():
+        return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "healthy", "service": "api"})
+
+    @app.route('/api/health')
+    def api_health():
+        return jsonify({"status": "healthy", "service": "api"})
+
+    @app.route('/api/users')
+    def get_users():
+        start_time = time.time()
+        conn = get_db_connection()
+        if not conn:
+            ERROR_COUNT.inc()
+            return jsonify({"error": "Database connection failed"}), 500
+        
+        try:
+            cur = conn.cursor()
+            cur.execute('SELECT id, name, email, created_at FROM users')
+            users = cur.fetchall()
+            cur.close()
+            close_db_connection(conn)
+            
+            user_list = []
+            for user in users:
+                user_list.append({
+                    "id": user[0],
+                    "name": user[1],
+                    "email": user[2],
+                    "created_at": str(user[3])
+                })
+            
+            DB_QUERY_DURATION.observe(time.time() - start_time)
+            return jsonify({"users": user_list})
+        except Exception as e:
+            app.logger.error(f"Query failed: {e}")
+            ERROR_COUNT.inc()
+            close_db_connection(conn)
+            return jsonify({"error": "Query failed"}), 500
+
+    @app.route('/api/users', methods=['POST'])
+    def create_user():
+        start_time = time.time()
+        data = request.get_json()
+        if not data or 'name' not in data or 'email' not in data:
+            return jsonify({"error": "Name and email required"}), 400
+        
+        conn = get_db_connection()
+        if not conn:
+            ERROR_COUNT.inc()
+            return jsonify({"error": "Database connection failed"}), 500
+        
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                'INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id',
+                (data['name'], data['email'])
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+            close_db_connection(conn)
+            
+            DB_QUERY_DURATION.observe(time.time() - start_time)
+            return jsonify({"id": user_id, "message": "User created successfully"}), 201
+        except Exception as e:
+            app.logger.error(f"User creation failed: {e}")
+            ERROR_COUNT.inc()
+            close_db_connection(conn)
+            return jsonify({"error": "User creation failed"}), 500
+
+    if __name__ == '__main__':
+        # Wait for database to be ready
+        time.sleep(10)
+        init_db()
+        app.run(host='0.0.0.0', port=8080, debug=True)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+  labels:
+    app: api
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: api
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_HOST
+          value: "database"
+        - name: DB_NAME
+          value: "demoapp"
+        - name: DB_USER
+          value: "demouser"
+        - name: DB_PASSWORD
+          value: "demopass"
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask psycopg2-binary prometheus_client
+          python /app/app.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: api-code
+          mountPath: /app
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: api-code
+        configMap:
+          name: api-config-metrics

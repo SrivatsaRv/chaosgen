@@ -2,40 +2,38 @@
 Kubernetes Inventory Fetch Tool
 
 Discovers services, deployments, statefulsets, and other resources
-across configured namespaces and creates a unified service graph.
+through pure Kubernetes API discovery. No configuration files needed.
 """
 
 import json
-import yaml
 import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 import os
+import re
 
 import structlog
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
-from kubernetes.config import kube_config
 
 logger = structlog.get_logger()
 
 
 class InventoryFetchError(Exception):
     """Custom exception for inventory fetch errors"""
-
     pass
 
 
 class InventoryFetchTool:
     """
-    Fetches Kubernetes inventory and creates a unified service graph.
-
+    Fetches Kubernetes inventory through pure API discovery.
+    
     Features:
-    - Robust error handling with helpful suggestions
-    - Graceful degradation when services are unavailable
-    - Comprehensive validation and hints
+    - Auto-discovers services across namespaces
+    - Infers service relationships and dependencies
+    - No configuration files required
     - Mock mode for testing
     """
 
@@ -48,181 +46,480 @@ class InventoryFetchTool:
         self.warnings = []
         self.suggestions = []
 
-        if not self.mock_mode:
-            self._init_kubernetes_client()
-        else:
-            logger.info("Running in mock mode - no Kubernetes connection required")
-
-    def _init_kubernetes_client(self):
-        """Initialize Kubernetes API clients with comprehensive error handling"""
+    def _init_kubernetes_clients(self):
+        """Initialize Kubernetes API clients"""
         try:
-            # Check if kubectl is available
-            if not self._check_kubectl_available():
-                raise InventoryFetchError("kubectl is not available in PATH")
+            # Try to load in-cluster config first, then local kubeconfig
+            try:
+                config.load_incluster_config()
+                logger.info("kubernetes_config_loaded", source="in_cluster")
+            except config.ConfigException:
+                config.load_kube_config()
+                logger.info("kubernetes_config_loaded", source="local_kubeconfig")
 
-            # Check if kubeconfig exists and is valid
-            kubeconfig_path = self._get_kubeconfig_path()
-            if not self._validate_kubeconfig(kubeconfig_path):
-                raise InventoryFetchError(f"Invalid kubeconfig at {kubeconfig_path}")
-
-            # Load kubeconfig
-            config.load_kube_config()
-
-            # Create API clients
-            self.v1_apps = client.AppsV1Api()
             self.v1_core = client.CoreV1Api()
+            self.v1_apps = client.AppsV1Api()
             self.v1_networking = client.NetworkingV1Api()
+            
+            logger.info("kubernetes_clients_initialized", 
+                       clients=["CoreV1Api", "AppsV1Api", "NetworkingV1Api"])
 
-            # Test connection
-            self._test_kubernetes_connection()
-
-            logger.info("Kubernetes client initialized successfully")
-
-        except InventoryFetchError:
-            raise
         except Exception as e:
-            error_msg = f"Failed to initialize Kubernetes client: {str(e)}"
-            suggestions = self._get_connection_suggestions(str(e))
-            raise InventoryFetchError(f"{error_msg}\n\nSuggestions:\n{suggestions}")
+            logger.error("kubernetes_client_init_failed", error=str(e))
+            raise InventoryFetchError(f"Failed to initialize Kubernetes clients: {str(e)}")
 
-    def _check_kubectl_available(self) -> bool:
-        """Check if kubectl is available in PATH"""
+    def _get_cluster_info(self) -> Dict[str, Any]:
+        """Get basic cluster information"""
         try:
-            result = subprocess.run(
-                ["kubectl", "version", "--client"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            return False
+            version = client.VersionApi().get_code()
+            nodes = self.v1_core.list_node()
+            
+            cluster_info = {
+                "kubernetes_version": version.git_version,
+                "node_count": len(nodes.items),
+                "provider": self._detect_provider(nodes.items),
+            }
+            
+            logger.info("cluster_info_retrieved", 
+                       version=cluster_info["kubernetes_version"],
+                       node_count=cluster_info["node_count"],
+                       provider=cluster_info["provider"])
+            
+            return cluster_info
+            
+        except Exception as e:
+            logger.warning("cluster_info_fetch_failed", error=str(e))
+            return {"kubernetes_version": "unknown", "node_count": 0, "provider": "unknown"}
 
-    def _get_kubeconfig_path(self) -> str:
-        """Get the path to kubeconfig file"""
-        # Check environment variable first
-        kubeconfig = os.getenv("KUBECONFIG")
-        if kubeconfig:
-            return kubeconfig
+    def _detect_provider(self, nodes) -> str:
+        """Detect cloud provider from node labels"""
+        if not nodes:
+            return "unknown"
+        
+        node = nodes[0]
+        labels = node.metadata.labels or {}
+        
+        if "eks.amazonaws.com" in str(labels):
+            return "aws-eks"
+        elif "gke.io" in str(labels):
+            return "gcp-gke"
+        elif "kubernetes.azure.com" in str(labels):
+            return "azure-aks"
+        else:
+            return "unknown"
 
-        # Default location
-        home = os.path.expanduser("~")
-        return os.path.join(home, ".kube", "config")
-
-    def _validate_kubeconfig(self, kubeconfig_path: str) -> bool:
-        """Validate kubeconfig file exists and is readable"""
-        if not os.path.exists(kubeconfig_path):
-            self.suggestions.append(f"Kubeconfig not found at {kubeconfig_path}")
-            self.suggestions.append(
-                "Run: aws eks update-kubeconfig --region <region> --name <cluster-name>"
-            )
-            return False
-
+    def _discover_namespaces(self, exclude_system: bool = True) -> List[str]:
+        """Discover all namespaces, optionally excluding system ones"""
         try:
-            with open(kubeconfig_path, "r") as f:
-                yaml.safe_load(f)
+            namespaces = self.v1_core.list_namespace()
+            namespace_names = [ns.metadata.name for ns in namespaces.items]
+            
+            if exclude_system:
+                # Filter out common system namespaces
+                system_namespaces = {
+                    'kube-system', 'kube-public', 'kube-node-lease', 
+                    'kubernetes-dashboard', 'istio-system', 'linkerd',
+                    'monitoring', 'logging', 'cert-manager'
+                }
+                namespace_names = [ns for ns in namespace_names if ns not in system_namespaces]
+            
+            logger.info("namespaces_discovered", 
+                       total_count=len(namespace_names),
+                       namespaces=namespace_names,
+                       excluded_system=exclude_system)
+            
+            return namespace_names
+            
+        except Exception as e:
+            logger.warning("namespace_discovery_failed", error=str(e))
+            self.warnings.append(f"Could not discover namespaces: {str(e)}")
+            return ["default"]
+
+    def _fetch_deployments(self, namespace: str) -> List[Dict[str, Any]]:
+        """Fetch all deployments in a namespace"""
+        try:
+            deployments = self.v1_apps.list_namespaced_deployment(namespace)
+            services = []
+            
+            for deployment in deployments.items:
+                # Get associated service
+                service_info = self._find_service_for_deployment(namespace, deployment)
+                
+                service = {
+                    "name": deployment.metadata.name,
+                    "namespace": namespace,
+                    "type": "deployment",
+                    "replicas": deployment.spec.replicas or 1,
+                    "labels": deployment.metadata.labels or {},
+                    "selector": deployment.spec.selector.match_labels or {},
+                    "containers": self._extract_container_info(deployment.spec.template.spec.containers),
+                    "service": service_info,
+                    "critical": self._infer_criticality(deployment),
+                    "tier": self._infer_tier(deployment),
+                }
+                services.append(service)
+                
+                logger.debug("deployment_processed",
+                           name=deployment.metadata.name,
+                           namespace=namespace,
+                           replicas=service["replicas"],
+                           tier=service["tier"],
+                           critical=service["critical"])
+                
+            logger.info("deployments_fetched", 
+                       namespace=namespace, 
+                       count=len(services))
+            
+            return services
+            
+        except Exception as e:
+            error_msg = f"Failed to fetch deployments from namespace {namespace}: {str(e)}"
+            logger.error("deployment_fetch_failed", namespace=namespace, error=str(e))
+            self.warnings.append(error_msg)
+            return []
+
+    def _fetch_statefulsets(self, namespace: str) -> List[Dict[str, Any]]:
+        """Fetch all statefulsets in a namespace"""
+        try:
+            statefulsets = self.v1_apps.list_namespaced_stateful_set(namespace)
+            services = []
+            
+            for sts in statefulsets.items:
+                service_info = self._find_service_for_statefulset(namespace, sts)
+                
+                service = {
+                    "name": sts.metadata.name,
+                    "namespace": namespace,
+                    "type": "statefulset",
+                    "replicas": sts.spec.replicas or 1,
+                    "labels": sts.metadata.labels or {},
+                    "selector": sts.spec.selector.match_labels or {},
+                    "containers": self._extract_container_info(sts.spec.template.spec.containers),
+                    "service": service_info,
+                    "critical": True,  # StatefulSets are usually critical (databases, etc.)
+                    "tier": "database",  # Most StatefulSets are data tier
+                }
+                services.append(service)
+                
+                logger.debug("statefulset_processed",
+                           name=sts.metadata.name,
+                           namespace=namespace,
+                           replicas=service["replicas"])
+                
+            logger.info("statefulsets_fetched", 
+                       namespace=namespace, 
+                       count=len(services))
+            
+            return services
+            
+        except Exception as e:
+            error_msg = f"Failed to fetch statefulsets from namespace {namespace}: {str(e)}"
+            logger.error("statefulset_fetch_failed", namespace=namespace, error=str(e))
+            self.warnings.append(error_msg)
+            return []
+
+    def _find_service_for_deployment(self, namespace: str, deployment) -> Optional[Dict[str, Any]]:
+        """Find Kubernetes service that exposes this deployment"""
+        try:
+            services = self.v1_core.list_namespaced_service(namespace)
+            deployment_labels = deployment.spec.selector.match_labels or {}
+            
+            for svc in services.items:
+                svc_selector = svc.spec.selector or {}
+                # Check if service selector matches deployment labels
+                if self._labels_match(svc_selector, deployment_labels):
+                    service_info = {
+                        "name": svc.metadata.name,
+                        "type": svc.spec.type,
+                        "ports": [{"port": p.port, "targetPort": p.target_port} for p in svc.spec.ports or []],
+                        "cluster_ip": svc.spec.cluster_ip,
+                    }
+                    
+                    logger.debug("service_matched_to_deployment",
+                               deployment=deployment.metadata.name,
+                               service=svc.metadata.name,
+                               namespace=namespace)
+                    
+                    return service_info
+            
+            logger.debug("no_service_found_for_deployment",
+                        deployment=deployment.metadata.name,
+                        namespace=namespace)
+            return None
+            
+        except Exception as e:
+            logger.warning("service_lookup_failed",
+                          deployment=deployment.metadata.name,
+                          namespace=namespace,
+                          error=str(e))
+            return None
+
+    def _find_service_for_statefulset(self, namespace: str, sts) -> Optional[Dict[str, Any]]:
+        """Find Kubernetes service that exposes this statefulset"""
+        try:
+            services = self.v1_core.list_namespaced_service(namespace)
+            sts_labels = sts.spec.selector.match_labels or {}
+            
+            for svc in services.items:
+                svc_selector = svc.spec.selector or {}
+                if self._labels_match(svc_selector, sts_labels):
+                    service_info = {
+                        "name": svc.metadata.name,
+                        "type": svc.spec.type,
+                        "ports": [{"port": p.port, "targetPort": p.target_port} for p in svc.spec.ports or []],
+                        "cluster_ip": svc.spec.cluster_ip,
+                    }
+                    
+                    logger.debug("service_matched_to_statefulset",
+                               statefulset=sts.metadata.name,
+                               service=svc.metadata.name,
+                               namespace=namespace)
+                    
+                    return service_info
+            
+            logger.debug("no_service_found_for_statefulset",
+                        statefulset=sts.metadata.name,
+                        namespace=namespace)
+            return None
+            
+        except Exception as e:
+            logger.warning("service_lookup_failed",
+                          statefulset=sts.metadata.name,
+                          namespace=namespace,
+                          error=str(e))
+            return None
+
+    def _labels_match(self, selector: Dict[str, str], labels: Dict[str, str]) -> bool:
+        """Check if selector matches labels"""
+        if not selector:
+            return False
+        return all(labels.get(k) == v for k, v in selector.items())
+
+    def _extract_container_info(self, containers) -> List[Dict[str, Any]]:
+        """Extract container information"""
+        container_info = []
+        for container in containers:
+            info = {
+                "name": container.name,
+                "image": container.image,
+                "ports": [p.container_port for p in container.ports or []],
+                "env_vars": {env.name: env.value for env in container.env or [] if env.value},
+            }
+            container_info.append(info)
+        return container_info
+
+    def _infer_criticality(self, resource) -> bool:
+        """Infer if a service is critical based on labels, name, etc."""
+        name = resource.metadata.name.lower()
+        labels = resource.metadata.labels or {}
+        
+        # Critical indicators
+        critical_keywords = ['frontend', 'api', 'gateway', 'auth', 'payment', 'order']
+        critical_labels = ['critical', 'production', 'important']
+        
+        # Check name
+        if any(keyword in name for keyword in critical_keywords):
             return True
-        except Exception as e:
-            self.suggestions.append(f"Invalid kubeconfig format: {str(e)}")
-            return False
+            
+        # Check labels
+        if any(label in str(labels).lower() for label in critical_labels):
+            return True
+            
+        # High replica count suggests importance
+        replicas = getattr(resource.spec, 'replicas', 1) or 1
+        if replicas > 2:
+            return True
+            
+        return False
 
-    def _test_kubernetes_connection(self):
-        """Test connection to Kubernetes cluster"""
-        try:
-            # Try to get cluster info
-            version_api = client.VersionApi()
-            version_info = version_api.get_code()
-            logger.info("Connected to cluster", version=version_info.git_version)
-        except ApiException as e:
-            if e.status == 401:
-                raise InventoryFetchError(
-                    "Authentication failed. Check your kubeconfig credentials."
-                )
-            elif e.status == 403:
-                raise InventoryFetchError("Access denied. Check your RBAC permissions.")
-            else:
-                raise InventoryFetchError(f"Failed to connect to cluster: {e.reason}")
-        except Exception as e:
-            raise InventoryFetchError(f"Failed to test cluster connection: {str(e)}")
+    def _infer_tier(self, resource) -> str:
+        """Infer service tier based on name and labels"""
+        name = resource.metadata.name.lower()
+        labels = resource.metadata.labels or {}
+        
+        # Check explicit tier label
+        if 'tier' in labels:
+            return labels['tier']
+            
+        # Infer from name
+        if any(keyword in name for keyword in ['frontend', 'ui', 'web']):
+            return 'frontend'
+        elif any(keyword in name for keyword in ['api', 'backend', 'service']):
+            return 'backend'
+        elif any(keyword in name for keyword in ['db', 'database', 'redis', 'mongo', 'postgres']):
+            return 'database'
+        elif any(keyword in name for keyword in ['queue', 'worker', 'job']):
+            return 'worker'
+        else:
+            return 'backend'  # Default
 
-    def _get_connection_suggestions(self, error: str) -> str:
-        """Get helpful suggestions based on the error"""
-        suggestions = []
+    def _infer_dependencies(self, services: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Infer service dependencies from environment variables and naming patterns"""
+        dependency_count = 0
+        
+        for service in services:
+            dependencies = []
+            
+            # Check environment variables for service references
+            for container in service.get('containers', []):
+                env_vars = container.get('env_vars', {})
+                
+                for env_name, env_value in env_vars.items():
+                    if env_value:
+                        # Look for service names in env vars
+                        for other_service in services:
+                            if (other_service['name'] != service['name'] and 
+                                other_service['name'].lower() in env_value.lower()):
+                                dependencies.append(other_service['name'])
+            
+            # Infer common patterns (frontend -> backend -> database)
+            service_tier = service.get('tier', '')
+            if service_tier == 'frontend':
+                # Frontend typically depends on backend/api services
+                backend_services = [s['name'] for s in services 
+                                 if s['tier'] in ['backend', 'api'] and s['name'] != service['name']]
+                dependencies.extend(backend_services)
+            elif service_tier == 'backend':
+                # Backend typically depends on databases
+                db_services = [s['name'] for s in services 
+                             if s['tier'] == 'database' and s['name'] != service['name']]
+                dependencies.extend(db_services)
+            
+            service['dependencies'] = list(set(dependencies))  # Remove duplicates
+            dependency_count += len(service['dependencies'])
+            
+            if service['dependencies']:
+                logger.debug("dependencies_inferred",
+                           service=service['name'],
+                           dependencies=service['dependencies'])
+        
+        logger.info("dependency_inference_completed",
+                   total_dependencies=dependency_count)
+        
+        return services
 
-        if "kubeconfig" in error.lower():
-            suggestions.extend(
-                [
-                    "1. Check if kubectl is installed: brew install kubectl",
-                    "2. Configure kubectl for your cluster:",
-                    "   - AWS EKS: aws eks update-kubeconfig --region <region> --name <cluster-name>",
-                    "   - GKE: gcloud container clusters get-credentials <cluster-name> --region <region>",
-                    "   - AKS: az aks get-credentials --resource-group <rg> --name <cluster-name>",
-                    "3. Verify cluster is running: kubectl cluster-info",
-                ]
-            )
-        elif "authentication" in error.lower():
-            suggestions.extend(
-                [
-                    "1. Check your AWS credentials: aws sts get-caller-identity",
-                    "2. Update kubeconfig: aws eks update-kubeconfig --region <region> --name <cluster-name>",
-                    "3. Check IAM permissions for EKS access",
-                ]
-            )
-        elif "connection" in error.lower():
-            suggestions.extend(
-                [
-                    "1. Check if cluster is running: kubectl cluster-info",
-                    "2. Verify network connectivity to cluster endpoint",
-                    "3. Check if you're on the correct VPN if required",
-                ]
-            )
+    def _build_service_relationships(self, services: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Build service relationship graph"""
+        relationships = []
+        
+        for service in services:
+            for dep in service.get('dependencies', []):
+                relationships.append({
+                    "source": service['name'],
+                    "target": dep,
+                    "type": "depends_on",
+                    "namespace": service['namespace']
+                })
+        
+        logger.info("service_relationships_built", count=len(relationships))
+        return relationships
 
-        return "\n".join(suggestions)
+    def _get_mock_topology(self) -> Dict[str, Any]:
+        """Return mock topology for testing"""
+        logger.info("returning_mock_topology")
+        
+        return {
+            "metadata": {
+                "generated_at": datetime.utcnow().isoformat(),
+                "cluster": {"kubernetes_version": "v1.28.0", "provider": "mock"},
+                "namespaces_scanned": ["demo"],
+                "total_services": 3,
+                "errors": [],
+                "warnings": [],
+                "suggestions": [],
+            },
+            "services": [
+                {
+                    "name": "frontend",
+                    "namespace": "demo",
+                    "type": "deployment",
+                    "replicas": 2,
+                    "critical": True,
+                    "tier": "frontend",
+                    "dependencies": ["api"],
+                    "labels": {"app": "frontend", "tier": "frontend"},
+                },
+                {
+                    "name": "api",
+                    "namespace": "demo", 
+                    "type": "deployment",
+                    "replicas": 2,
+                    "critical": True,
+                    "tier": "backend",
+                    "dependencies": ["redis"],
+                    "labels": {"app": "api", "tier": "backend"},
+                },
+                {
+                    "name": "redis",
+                    "namespace": "demo",
+                    "type": "deployment", 
+                    "replicas": 1,
+                    "critical": True,
+                    "tier": "database",
+                    "dependencies": [],
+                    "labels": {"app": "redis", "tier": "database"},
+                }
+            ],
+            "relationships": [
+                {"source": "frontend", "target": "api", "type": "depends_on", "namespace": "demo"},
+                {"source": "api", "target": "redis", "type": "depends_on", "namespace": "demo"}
+            ]
+        }
 
-    def run(self) -> Dict[str, Any]:
+    def run(self, namespaces: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Main method to fetch inventory from Kubernetes cluster.
-
+        
+        Args:
+            namespaces: Optional list of namespaces to scan. If None, auto-discovers.
+            
         Returns:
             Dictionary containing unified service graph
         """
-        logger.info("Starting inventory fetch", mock_mode=self.mock_mode)
+        logger.info("inventory_fetch_started", mock_mode=self.mock_mode)
 
         try:
             if self.mock_mode:
-                return self._get_mock_topology(stack_file)
+                return self._get_mock_topology()
 
-            # Load configuration
-            config_data = self._load_config(stack_file)
-            k8s_config = config_data.get("k8s", {})
+            # Initialize Kubernetes clients
+            self._init_kubernetes_clients()
 
-            # Validate configuration
-            self._validate_config(k8s_config)
-
-            # Get namespaces to scan
-            namespaces = k8s_config.get("namespaces", ["default"])
-            target_services = k8s_config.get("target_services", [])
-
-            # Fetch cluster information
+            # Get cluster information
             cluster_info = self._get_cluster_info()
 
+            # Discover namespaces if not provided
+            if namespaces is None:
+                namespaces = self._discover_namespaces()
+            
+            logger.info("scanning_namespaces", namespaces=namespaces)
+
             # Fetch services from each namespace
-            services = []
+            all_services = []
             for namespace in namespaces:
                 try:
-                    namespace_services = self._fetch_namespace_services(
-                        namespace, target_services
-                    )
-                    services.extend(namespace_services)
-                    logger.info(
-                        "Fetched services from namespace",
-                        namespace=namespace,
-                        count=len(namespace_services),
-                    )
+                    # Fetch deployments and statefulsets
+                    deployments = self._fetch_deployments(namespace)
+                    statefulsets = self._fetch_statefulsets(namespace)
+                    
+                    namespace_services = deployments + statefulsets
+                    all_services.extend(namespace_services)
+                    
+                    logger.info("namespace_scan_completed",
+                               namespace=namespace,
+                               deployments=len(deployments),
+                               statefulsets=len(statefulsets),
+                               total=len(namespace_services))
+                               
                 except Exception as e:
                     error_msg = f"Failed to fetch from namespace {namespace}: {str(e)}"
                     self.warnings.append(error_msg)
-                    logger.warning(error_msg)
+                    logger.error("namespace_scan_failed", 
+                                namespace=namespace, 
+                                error=str(e))
+
+            # Infer service dependencies
+            all_services = self._infer_dependencies(all_services)
 
             # Create unified topology
             topology = {
@@ -230,639 +527,66 @@ class InventoryFetchTool:
                     "generated_at": datetime.utcnow().isoformat(),
                     "cluster": cluster_info,
                     "namespaces_scanned": namespaces,
-                    "total_services": len(services),
+                    "total_services": len(all_services),
                     "errors": self.errors,
                     "warnings": self.warnings,
                     "suggestions": self.suggestions,
                 },
-                "services": services,
-                "relationships": self._build_service_relationships(services),
+                "services": all_services,
+                "relationships": self._build_service_relationships(all_services),
             }
 
             # Print summary
             self._print_summary(topology)
 
-            logger.info(
-                "Inventory fetch completed",
-                total_services=len(services),
-                namespaces=len(namespaces),
-                errors=len(self.errors),
-                warnings=len(self.warnings),
-            )
+            logger.info("inventory_fetch_completed",
+                       total_services=len(all_services),
+                       namespaces_count=len(namespaces),
+                       relationships_count=len(topology["relationships"]),
+                       errors_count=len(self.errors),
+                       warnings_count=len(self.warnings))
 
             return topology
 
         except Exception as e:
-            logger.error("Inventory fetch failed", error=str(e))
-            raise InventoryFetchError(f"Inventory fetch failed: {str(e)}")
-
-    def _validate_config(self, k8s_config: Dict[str, Any]):
-        """Validate Kubernetes configuration"""
-        if not k8s_config:
-            self.warnings.append("No Kubernetes configuration found in stack.yaml")
-            self.suggestions.append("Add k8s configuration to stack.yaml")
-            return
-
-        namespaces = k8s_config.get("namespaces", [])
-        if not namespaces:
-            self.warnings.append("No namespaces configured")
-            self.suggestions.append("Add namespaces to k8s.namespaces in stack.yaml")
-
-    def _load_config(self, stack_file: Path) -> Dict[str, Any]:
-        """Load and parse stack configuration file with error handling"""
-        try:
-            if not stack_file.exists():
-                raise InventoryFetchError(
-                    f"Stack configuration file not found: {stack_file}"
-                )
-
-            with open(stack_file, "r") as f:
-                config_data = yaml.safe_load(f)
-
-            if not config_data:
-                raise InventoryFetchError("Stack configuration file is empty")
-
-            return config_data
-
-        except yaml.YAMLError as e:
-            raise InventoryFetchError(f"Invalid YAML in stack configuration: {str(e)}")
-        except Exception as e:
-            raise InventoryFetchError(f"Failed to load stack configuration: {str(e)}")
-
-    def _get_cluster_info(self) -> Dict[str, Any]:
-        """Get basic cluster information with error handling"""
-        try:
-            # Get cluster version
-            version_api = client.VersionApi()
-            version_info = version_api.get_code()
-
-            # Get nodes info
-            nodes = self.v1_core.list_node()
-
-            cluster_info = {
-                "kubernetes_version": version_info.git_version,
-                "platform": version_info.platform,
-                "node_count": len(nodes.items),
-                "provider": self._detect_provider(nodes.items),
-            }
-
-            logger.info(
-                "Cluster info retrieved",
-                version=version_info.git_version,
-                nodes=len(nodes.items),
-                provider=cluster_info["provider"],
-            )
-
-            return cluster_info
-
-        except Exception as e:
-            error_msg = f"Failed to get cluster info: {str(e)}"
-            self.warnings.append(error_msg)
-            logger.warning(error_msg)
-            return {"error": str(e)}
-
-    def _detect_provider(self, nodes: List) -> str:
-        """Detect cloud provider from node labels"""
-        for node in nodes:
-            labels = node.metadata.labels or {}
-            if "eks.amazonaws.com" in str(labels):
-                return "aws-eks"
-            elif "gke.io" in str(labels):
-                return "gcp-gke"
-            elif "aks.azure.com" in str(labels):
-                return "azure-aks"
-        return "unknown"
-
-    def _fetch_namespace_services(
-        self, namespace: str, target_services: List[Dict]
-    ) -> List[Dict]:
-        """Fetch all services from a specific namespace with comprehensive error handling"""
-        services = []
-
-        # Check if namespace exists
-        try:
-            self.v1_core.read_namespace(name=namespace)
-        except ApiException as e:
-            if e.status == 404:
-                error_msg = f"Namespace '{namespace}' not found"
-                self.warnings.append(error_msg)
-                self.suggestions.append(
-                    f"Create namespace: kubectl create namespace {namespace}"
-                )
-                return services
-            else:
-                error_msg = f"Failed to access namespace '{namespace}': {e.reason}"
-                self.warnings.append(error_msg)
-                return services
-
-        # Fetch Deployments
-        try:
-            deployments = self.v1_apps.list_namespaced_deployment(namespace=namespace)
-            for deployment in deployments.items:
-                service_info = self._extract_deployment_info(deployment, namespace)
-                if service_info:
-                    services.append(service_info)
-        except ApiException as e:
-            error_msg = f"Failed to fetch deployments from {namespace}: {e.reason}"
-            self.warnings.append(error_msg)
-        except Exception as e:
-            error_msg = (
-                f"Unexpected error fetching deployments from {namespace}: {str(e)}"
-            )
-            self.warnings.append(error_msg)
-
-        # Fetch StatefulSets
-        try:
-            statefulsets = self.v1_apps.list_namespaced_stateful_set(
-                namespace=namespace
-            )
-            for statefulset in statefulsets.items:
-                service_info = self._extract_statefulset_info(statefulset, namespace)
-                if service_info:
-                    services.append(service_info)
-        except ApiException as e:
-            error_msg = f"Failed to fetch statefulsets from {namespace}: {e.reason}"
-            self.warnings.append(error_msg)
-        except Exception as e:
-            error_msg = (
-                f"Unexpected error fetching statefulsets from {namespace}: {str(e)}"
-            )
-            self.warnings.append(error_msg)
-
-        # Fetch DaemonSets
-        try:
-            daemonsets = self.v1_apps.list_namespaced_daemon_set(namespace=namespace)
-            for daemonset in daemonsets.items:
-                service_info = self._extract_daemonset_info(daemonset, namespace)
-                if service_info:
-                    services.append(service_info)
-        except ApiException as e:
-            error_msg = f"Failed to fetch daemonsets from {namespace}: {e.reason}"
-            self.warnings.append(error_msg)
-        except Exception as e:
-            error_msg = (
-                f"Unexpected error fetching daemonsets from {namespace}: {str(e)}"
-            )
-            self.warnings.append(error_msg)
-
-        # Fetch Services
-        try:
-            k8s_services = self.v1_core.list_namespaced_service(namespace=namespace)
-            for k8s_service in k8s_services.items:
-                service_info = self._extract_service_info(k8s_service, namespace)
-                if service_info:
-                    services.append(service_info)
-        except ApiException as e:
-            error_msg = f"Failed to fetch services from {namespace}: {e.reason}"
-            self.warnings.append(error_msg)
-        except Exception as e:
-            error_msg = f"Unexpected error fetching services from {namespace}: {str(e)}"
-            self.warnings.append(error_msg)
-
-        return services
-
-    def _extract_deployment_info(
-        self, deployment, namespace: str
-    ) -> Optional[Dict[str, Any]]:
-        """Extract relevant information from a Deployment with error handling"""
-        try:
-            metadata = deployment.metadata
-            spec = deployment.spec
-            status = deployment.status
-
-            # Get resource requirements
-            resources = self._extract_resource_requirements(
-                spec.template.spec.containers
-            )
-
-            # Get labels and annotations
-            labels = metadata.labels or {}
-            annotations = metadata.annotations or {}
-
-            return {
-                "id": f"{namespace}/{metadata.name}",
-                "name": metadata.name,
-                "namespace": namespace,
-                "env": "k8s",
-                "type": "deployment",
-                "api_version": deployment.api_version,
-                "replicas": {
-                    "desired": spec.replicas,
-                    "available": (
-                        status.available_replicas if status.available_replicas else 0
-                    ),
-                    "ready": status.ready_replicas if status.ready_replicas else 0,
-                },
-                "labels": dict(labels),
-                "annotations": dict(annotations),
-                "resources": resources,
-                "containers": [
-                    {
-                        "name": container.name,
-                        "image": container.image,
-                        "ports": (
-                            [
-                                {
-                                    "container_port": port.container_port,
-                                    "protocol": port.protocol,
-                                }
-                                for port in container.ports
-                            ]
-                            if container.ports
-                            else []
-                        ),
-                    }
-                    for container in spec.template.spec.containers
-                ],
-                "critical": self._is_critical_service(metadata.name, namespace),
-                "created_at": (
-                    metadata.creation_timestamp.isoformat()
-                    if metadata.creation_timestamp
-                    else None
-                ),
-            }
-        except Exception as e:
-            error_msg = f"Failed to extract deployment info for {deployment.metadata.name}: {str(e)}"
-            self.warnings.append(error_msg)
-            logger.warning(error_msg)
-            return None
-
-    def _extract_statefulset_info(
-        self, statefulset, namespace: str
-    ) -> Optional[Dict[str, Any]]:
-        """Extract relevant information from a StatefulSet with error handling"""
-        try:
-            metadata = statefulset.metadata
-            spec = statefulset.spec
-            status = statefulset.status
-
-            resources = self._extract_resource_requirements(
-                spec.template.spec.containers
-            )
-            labels = metadata.labels or {}
-            annotations = metadata.annotations or {}
-
-            return {
-                "id": f"{namespace}/{metadata.name}",
-                "name": metadata.name,
-                "namespace": namespace,
-                "env": "k8s",
-                "type": "statefulset",
-                "api_version": statefulset.api_version,
-                "replicas": {
-                    "desired": spec.replicas,
-                    "available": (
-                        status.available_replicas if status.available_replicas else 0
-                    ),
-                    "ready": status.ready_replicas if status.ready_replicas else 0,
-                },
-                "labels": dict(labels),
-                "annotations": dict(annotations),
-                "resources": resources,
-                "containers": [
-                    {
-                        "name": container.name,
-                        "image": container.image,
-                        "ports": (
-                            [
-                                {
-                                    "container_port": port.container_port,
-                                    "protocol": port.protocol,
-                                }
-                                for port in container.ports
-                            ]
-                            if container.ports
-                            else []
-                        ),
-                    }
-                    for container in spec.template.spec.containers
-                ],
-                "critical": self._is_critical_service(metadata.name, namespace),
-                "created_at": (
-                    metadata.creation_timestamp.isoformat()
-                    if metadata.creation_timestamp
-                    else None
-                ),
-            }
-        except Exception as e:
-            error_msg = f"Failed to extract statefulset info for {statefulset.metadata.name}: {str(e)}"
-            self.warnings.append(error_msg)
-            logger.warning(error_msg)
-            return None
-
-    def _extract_daemonset_info(
-        self, daemonset, namespace: str
-    ) -> Optional[Dict[str, Any]]:
-        """Extract relevant information from a DaemonSet with error handling"""
-        try:
-            metadata = daemonset.metadata
-            spec = daemonset.spec
-            status = daemonset.status
-
-            resources = self._extract_resource_requirements(
-                spec.template.spec.containers
-            )
-            labels = metadata.labels or {}
-            annotations = metadata.annotations or {}
-
-            return {
-                "id": f"{namespace}/{metadata.name}",
-                "name": metadata.name,
-                "namespace": namespace,
-                "env": "k8s",
-                "type": "daemonset",
-                "api_version": daemonset.api_version,
-                "replicas": {
-                    "desired": status.desired_number_scheduled,
-                    "available": status.number_available,
-                    "ready": status.number_ready,
-                },
-                "labels": dict(labels),
-                "annotations": dict(annotations),
-                "resources": resources,
-                "containers": [
-                    {
-                        "name": container.name,
-                        "image": container.image,
-                        "ports": (
-                            [
-                                {
-                                    "container_port": port.container_port,
-                                    "protocol": port.protocol,
-                                }
-                                for port in container.ports
-                            ]
-                            if container.ports
-                            else []
-                        ),
-                    }
-                    for container in spec.template.spec.containers
-                ],
-                "critical": self._is_critical_service(metadata.name, namespace),
-                "created_at": (
-                    metadata.creation_timestamp.isoformat()
-                    if metadata.creation_timestamp
-                    else None
-                ),
-            }
-        except Exception as e:
-            error_msg = f"Failed to extract daemonset info for {daemonset.metadata.name}: {str(e)}"
-            self.warnings.append(error_msg)
-            logger.warning(error_msg)
-            return None
-
-    def _extract_service_info(
-        self, k8s_service, namespace: str
-    ) -> Optional[Dict[str, Any]]:
-        """Extract relevant information from a Service with error handling"""
-        try:
-            metadata = k8s_service.metadata
-            spec = k8s_service.spec
-
-            labels = metadata.labels or {}
-            annotations = metadata.annotations or {}
-
-            return {
-                "id": f"{namespace}/{metadata.name}",
-                "name": metadata.name,
-                "namespace": namespace,
-                "env": "k8s",
-                "type": "service",
-                "api_version": k8s_service.api_version,
-                "cluster_ip": spec.cluster_ip,
-                "service_type": spec.type,
-                "ports": (
-                    [
-                        {
-                            "port": port.port,
-                            "target_port": port.target_port,
-                            "protocol": port.protocol,
-                        }
-                        for port in spec.ports
-                    ]
-                    if spec.ports
-                    else []
-                ),
-                "selector": dict(spec.selector) if spec.selector else {},
-                "labels": dict(labels),
-                "annotations": dict(annotations),
-                "critical": self._is_critical_service(metadata.name, namespace),
-                "created_at": (
-                    metadata.creation_timestamp.isoformat()
-                    if metadata.creation_timestamp
-                    else None
-                ),
-            }
-        except Exception as e:
-            error_msg = f"Failed to extract service info for {k8s_service.metadata.name}: {str(e)}"
-            self.warnings.append(error_msg)
-            logger.warning(error_msg)
-            return None
-
-    def _extract_resource_requirements(self, containers: List) -> Dict[str, Any]:
-        """Extract resource requirements from containers with error handling"""
-        try:
-            total_requests = {"cpu": "0", "memory": "0"}
-            total_limits = {"cpu": "0", "memory": "0"}
-
-            for container in containers:
-                if container.resources:
-                    # Sum up requests
-                    if container.resources.requests:
-                        for resource, value in container.resources.requests.items():
-                            if resource in total_requests:
-                                # Simple addition (in real implementation, you'd want proper resource arithmetic)
-                                total_requests[resource] = str(
-                                    float(total_requests[resource]) + float(value)
-                                )
-
-                    # Sum up limits
-                    if container.resources.limits:
-                        for resource, value in container.resources.limits.items():
-                            if resource in total_limits:
-                                total_limits[resource] = str(
-                                    float(total_limits[resource]) + float(value)
-                                )
-
-            return {"requests": total_requests, "limits": total_limits}
-        except Exception as e:
-            logger.warning("Failed to extract resource requirements", error=str(e))
-            return {
-                "requests": {"cpu": "0", "memory": "0"},
-                "limits": {"cpu": "0", "memory": "0"},
-            }
-
-    def _is_critical_service(self, name: str, namespace: str) -> bool:
-        """Determine if a service is critical based on configuration or labels"""
-        # This could be enhanced with more sophisticated logic
-        critical_keywords = [
-            "redis",
-            "mysql",
-            "postgres",
-            "database",
-            "cache",
-            "frontend",
-            "api",
-        ]
-        return any(keyword in name.lower() for keyword in critical_keywords)
-
-    def _build_service_relationships(self, services: List[Dict]) -> List[Dict]:
-        """Build relationships between services based on selectors and dependencies"""
-        try:
-            relationships = []
-
-            # Find service-to-service relationships
-            for service in services:
-                if service["type"] == "service" and service.get("selector"):
-                    selector = service["selector"]
-
-                    # Find deployments/statefulsets that match this selector
-                    for target in services:
-                        if target["type"] in ["deployment", "statefulset", "daemonset"]:
-                            if target["namespace"] == service["namespace"]:
-                                # Check if labels match selector
-                                if self._labels_match_selector(
-                                    target.get("labels", {}), selector
-                                ):
-                                    relationships.append(
-                                        {
-                                            "from": service["id"],
-                                            "to": target["id"],
-                                            "type": "selector_match",
-                                            "namespace": service["namespace"],
-                                        }
-                                    )
-
-            return relationships
-        except Exception as e:
-            logger.warning("Failed to build service relationships", error=str(e))
-            return []
-
-    def _labels_match_selector(
-        self, labels: Dict[str, str], selector: Dict[str, str]
-    ) -> bool:
-        """Check if labels match a selector"""
-        try:
-            for key, value in selector.items():
-                if key not in labels or labels[key] != value:
-                    return False
-            return True
-        except Exception:
-            return False
-
-    def _print_summary(self, topology: Dict[str, Any]):
-        """Print a user-friendly summary of the inventory fetch"""
-        metadata = topology.get("metadata", {})
-        services = topology.get("services", [])
-
-        print("\n" + "=" * 60)
-        print("🏗️  INFRASTRUCTURE INVENTORY SUMMARY")
-        print("=" * 60)
-
-        # Cluster info
-        cluster_info = metadata.get("cluster", {})
-        if "error" not in cluster_info:
-            print(f"📊 Cluster: {cluster_info.get('kubernetes_version', 'Unknown')}")
-            print(f"   Provider: {cluster_info.get('provider', 'Unknown')}")
-            print(f"   Nodes: {cluster_info.get('node_count', 0)}")
-        else:
-            print(f"⚠️  Cluster info unavailable: {cluster_info['error']}")
-
-        # Services summary
-        services_by_type = {}
-        for service in services:
-            service_type = service.get("type", "unknown")
-            if service_type not in services_by_type:
-                services_by_type[service_type] = []
-            services_by_type[service_type].append(service)
-
-        print(f"\n📦 Services Found: {len(services)}")
-        for service_type, type_services in services_by_type.items():
-            print(f"   • {service_type.title()}: {len(type_services)}")
-
-        # Namespaces
-        namespaces = metadata.get("namespaces_scanned", [])
-        print(f"\n🏷️  Namespaces Scanned: {', '.join(namespaces)}")
-
-        # Critical services
-        critical_services = [s for s in services if s.get("critical", False)]
-        if critical_services:
-            print(f"\n🔴 Critical Services: {len(critical_services)}")
-            for service in critical_services[:5]:  # Show first 5
-                print(f"   • {service['name']} ({service['type']})")
-            if len(critical_services) > 5:
-                print(f"   ... and {len(critical_services) - 5} more")
-
-        # Warnings and suggestions
-        warnings = metadata.get("warnings", [])
-        suggestions = metadata.get("suggestions", [])
-
-        if warnings:
-            print(f"\n⚠️  Warnings ({len(warnings)}):")
-            for warning in warnings[:3]:  # Show first 3
-                print(f"   • {warning}")
-            if len(warnings) > 3:
-                print(f"   ... and {len(warnings) - 3} more warnings")
-
-        if suggestions:
-            print(f"\n💡 Suggestions ({len(suggestions)}):")
-            for suggestion in suggestions[:3]:  # Show first 3
-                print(f"   • {suggestion}")
-            if len(suggestions) > 3:
-                print(f"   ... and {len(suggestions) - 3} more suggestions")
-
-        print("\n" + "=" * 60)
-
-    def save_topology(
-        self, topology: Dict[str, Any], output_path: Path = Path("context/topo.json")
-    ):
-        """Save topology to JSON file"""
-        try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(output_path, "w") as f:
-                json.dump(topology, f, indent=2, default=str)
-
-            logger.info("Topology saved", path=str(output_path))
-            return output_path
-        except Exception as e:
-            error_msg = f"Failed to save topology: {str(e)}"
-            logger.error(error_msg)
+            error_msg = f"Inventory fetch failed: {str(e)}"
+            logger.error("inventory_fetch_failed", error=str(e))
             raise InventoryFetchError(error_msg)
 
-    def _get_mock_topology(self) -> Dict[str, Any]:
-        """Get mock topology for testing without Kubernetes connection"""
-        return {
-            "metadata": {
-                "generated_at": datetime.utcnow().isoformat(),
-                "cluster": {
-                    "kubernetes_version": "v1.28.0",
-                    "provider": "mock",
-                    "node_count": 3,
-                },
-                "namespaces_scanned": ["sock-shop"],
-                "total_services": 13,
-                "mock_mode": True,
-            },
-            "services": [
-                {
-                    "id": "sock-shop/front-end",
-                    "name": "front-end",
-                    "namespace": "sock-shop",
-                    "env": "k8s",
-                    "type": "deployment",
-                    "replicas": {"desired": 2, "available": 2, "ready": 2},
-                    "critical": True,
-                },
-                {
-                    "id": "sock-shop/redis",
-                    "name": "redis",
-                    "namespace": "sock-shop",
-                    "env": "k8s",
-                    "type": "statefulset",
-                    "replicas": {"desired": 1, "available": 1, "ready": 1},
-                    "critical": True,
-                },
-            ],
-            "relationships": [],
-        }
+    def _print_summary(self, topology: Dict[str, Any]):
+        """Print a human-readable summary of discovered services"""
+        services = topology.get("services", [])
+        relationships = topology.get("relationships", [])
+        
+        print(f"\nDiscovered {len(services)} services across {len(topology['metadata']['namespaces_scanned'])} namespaces:")
+        
+        # Group by namespace and tier
+        by_namespace = {}
+        for service in services:
+            ns = service['namespace']
+            if ns not in by_namespace:
+                by_namespace[ns] = {}
+            
+            tier = service.get('tier', 'unknown')
+            if tier not in by_namespace[ns]:
+                by_namespace[ns][tier] = []
+            by_namespace[ns][tier].append(service)
+        
+        for namespace, tiers in by_namespace.items():
+            print(f"\n  Namespace: {namespace}")
+            for tier, tier_services in tiers.items():
+                print(f"    {tier}: {', '.join([s['name'] for s in tier_services])}")
+        
+        if relationships:
+            print(f"\nDiscovered {len(relationships)} service relationships:")
+            for rel in relationships[:5]:  # Show first 5
+                print(f"    {rel['source']} -> {rel['target']}")
+            if len(relationships) > 5:
+                print(f"    ... and {len(relationships) - 5} more")
+        
+        if self.warnings:
+            print(f"\nWarnings ({len(self.warnings)}):")
+            for warning in self.warnings[:3]:
+                print(f"    {warning}")
+            if len(self.warnings) > 3:
+                print(f"    ... and {len(self.warnings) - 3} more")

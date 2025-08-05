@@ -1,0 +1,618 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+# PostgreSQL Database
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+  namespace: demo
+  labels:
+    app: database
+    tier: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+        tier: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "demoapp"
+        - name: POSTGRES_USER
+          value: "demouser"
+        - name: POSTGRES_PASSWORD
+          value: "demopass"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: demo
+  labels:
+    app: database
+    tier: database
+spec:
+  selector:
+    app: database
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+# Python API Backend
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: demo
+data:
+  app.py: |
+    from flask import Flask, jsonify, request
+    import psycopg2
+    import os
+    import time
+    import logging
+
+    app = Flask(__name__)
+    logging.basicConfig(level=logging.INFO)
+
+    # Database connection
+    def get_db_connection():
+        try:
+            conn = psycopg2.connect(
+                host=os.getenv('DB_HOST', 'database'),
+                database=os.getenv('DB_NAME', 'demoapp'),
+                user=os.getenv('DB_USER', 'demouser'),
+                password=os.getenv('DB_PASSWORD', 'demopass')
+            )
+            return conn
+        except Exception as e:
+            app.logger.error(f"Database connection failed: {e}")
+            return None
+
+    # Initialize database
+    def init_db():
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(100) NOT NULL,
+                        email VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                # Insert sample data
+                cur.execute('''
+                    INSERT INTO users (name, email) VALUES 
+                    ('Alice Johnson', 'alice@demo.com'),
+                    ('Bob Smith', 'bob@demo.com'),
+                    ('Carol Davis', 'carol@demo.com')
+                    ON CONFLICT DO NOTHING
+                ''')
+                conn.commit()
+                cur.close()
+                conn.close()
+                app.logger.info("Database initialized successfully")
+            except Exception as e:
+                app.logger.error(f"Database initialization failed: {e}")
+
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "healthy", "service": "api"})
+
+    @app.route('/api/health')
+    def api_health():
+        return jsonify({"status": "healthy", "service": "api"})
+
+    @app.route('/api/users')
+    def get_users():
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database connection failed"}), 500
+        
+        try:
+            cur = conn.cursor()
+            cur.execute('SELECT id, name, email, created_at FROM users')
+            users = cur.fetchall()
+            cur.close()
+            conn.close()
+            
+            user_list = []
+            for user in users:
+                user_list.append({
+                    "id": user[0],
+                    "name": user[1],
+                    "email": user[2],
+                    "created_at": str(user[3])
+                })
+            
+            return jsonify({"users": user_list})
+        except Exception as e:
+            app.logger.error(f"Query failed: {e}")
+            return jsonify({"error": "Query failed"}), 500
+
+    @app.route('/api/users', methods=['POST'])
+    def create_user():
+        data = request.get_json()
+        if not data or 'name' not in data or 'email' not in data:
+            return jsonify({"error": "Name and email required"}), 400
+        
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database connection failed"}), 500
+        
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                'INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id',
+                (data['name'], data['email'])
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            return jsonify({"id": user_id, "message": "User created successfully"}), 201
+        except Exception as e:
+            app.logger.error(f"User creation failed: {e}")
+            return jsonify({"error": "User creation failed"}), 500
+
+    if __name__ == '__main__':
+        # Wait for database to be ready
+        time.sleep(10)
+        init_db()
+        app.run(host='0.0.0.0', port=8080, debug=True)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: demo
+  labels:
+    app: api
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        tier: backend
+    spec:
+      containers:
+      - name: api
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_HOST
+          value: "database"
+        - name: DB_NAME
+          value: "demoapp"
+        - name: DB_USER
+          value: "demouser"
+        - name: DB_PASSWORD
+          value: "demopass"
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask psycopg2-binary
+          python /app/app.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: api-code
+          mountPath: /app
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: api-code
+        configMap:
+          name: api-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: demo
+  labels:
+    app: api
+    tier: backend
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+# HTML Frontend
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Demo 3-Tier Application</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .tier {
+                margin: 20px 0;
+                padding: 15px;
+                border-left: 4px solid #007bff;
+                background: #f8f9fa;
+            }
+            .tier h3 {
+                margin-top: 0;
+                color: #007bff;
+            }
+            .users-list {
+                margin-top: 20px;
+            }
+            .user-card {
+                background: #e9ecef;
+                padding: 10px;
+                margin: 5px 0;
+                border-radius: 5px;
+            }
+            .form-group {
+                margin: 10px 0;
+            }
+            .form-group label {
+                display: block;
+                margin-bottom: 5px;
+                font-weight: bold;
+            }
+            .form-group input {
+                width: 100%;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                box-sizing: border-box;
+            }
+            button {
+                background: #007bff;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                margin: 10px 5px 10px 0;
+            }
+            button:hover {
+                background: #0056b3;
+            }
+            .status {
+                padding: 10px;
+                margin: 10px 0;
+                border-radius: 4px;
+            }
+            .status.success {
+                background: #d4edda;
+                color: #155724;
+                border: 1px solid #c3e6cb;
+            }
+            .status.error {
+                background: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 Demo 3-Tier Application</h1>
+            
+            <div class="tier">
+                <h3>🎨 Frontend Tier</h3>
+                <p>This HTML page served by nginx (you're looking at it!)</p>
+                <p><strong>Status:</strong> <span id="frontend-status">✅ Active</span></p>
+            </div>
+            
+            <div class="tier">
+                <h3>⚙️ Backend API Tier</h3>
+                <p>Python Flask API with health checks and user management</p>
+                <p><strong>Status:</strong> <span id="api-status">🔄 Checking...</span></p>
+                <button onclick="checkApiHealth()">Check API Health</button>
+            </div>
+            
+            <div class="tier">
+                <h3>🗄️ Database Tier</h3>
+                <p>PostgreSQL database storing user information</p>
+                <p><strong>Status:</strong> <span id="db-status">🔄 Checking...</span></p>
+                <button onclick="loadUsers()">Test Database Connection</button>
+            </div>
+            
+            <div class="tier">
+                <h3>👥 User Management</h3>
+                <div class="form-group">
+                    <label for="userName">Name:</label>
+                    <input type="text" id="userName" placeholder="Enter user name">
+                </div>
+                <div class="form-group">
+                    <label for="userEmail">Email:</label>
+                    <input type="email" id="userEmail" placeholder="Enter user email">
+                </div>
+                <button onclick="createUser()">Add User</button>
+                <button onclick="loadUsers()">Refresh Users</button>
+                
+                <div id="status-message"></div>
+                <div id="users-list" class="users-list"></div>
+            </div>
+        </div>
+
+        <script>
+            const API_BASE = '/api';
+            
+            async function checkApiHealth() {
+                try {
+                    const response = await fetch(`${API_BASE}/health`);
+                    const data = await response.json();
+                    document.getElementById('api-status').innerHTML = '✅ Healthy';
+                    document.getElementById('db-status').innerHTML = '✅ Connected via API';
+                } catch (error) {
+                    document.getElementById('api-status').innerHTML = '❌ Unhealthy';
+                    document.getElementById('db-status').innerHTML = '❌ Connection Failed';
+                }
+            }
+            
+            async function loadUsers() {
+                try {
+                    const response = await fetch(`${API_BASE}/users`);
+                    const data = await response.json();
+                    
+                    if (data.users) {
+                        displayUsers(data.users);
+                        showStatus('Users loaded successfully!', 'success');
+                        document.getElementById('db-status').innerHTML = '✅ Connected';
+                    } else {
+                        showStatus('Failed to load users', 'error');
+                        document.getElementById('db-status').innerHTML = '❌ Connection Failed';
+                    }
+                } catch (error) {
+                    showStatus('Error connecting to API', 'error');
+                    document.getElementById('api-status').innerHTML = '❌ Unhealthy';
+                    document.getElementById('db-status').innerHTML = '❌ Connection Failed';
+                }
+            }
+            
+            async function createUser() {
+                const name = document.getElementById('userName').value;
+                const email = document.getElementById('userEmail').value;
+                
+                if (!name || !email) {
+                    showStatus('Please enter both name and email', 'error');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`${API_BASE}/users`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ name, email })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        showStatus('User created successfully!', 'success');
+                        document.getElementById('userName').value = '';
+                        document.getElementById('userEmail').value = '';
+                        loadUsers(); // Refresh the list
+                    } else {
+                        showStatus(data.error || 'Failed to create user', 'error');
+                    }
+                } catch (error) {
+                    showStatus('Error connecting to API', 'error');
+                }
+            }
+            
+            function displayUsers(users) {
+                const usersList = document.getElementById('users-list');
+                usersList.innerHTML = '<h4>Current Users:</h4>';
+                
+                users.forEach(user => {
+                    const userCard = document.createElement('div');
+                    userCard.className = 'user-card';
+                    userCard.innerHTML = `
+                        <strong>${user.name}</strong> - ${user.email}
+                        <br><small>ID: ${user.id} | Created: ${new Date(user.created_at).toLocaleString()}</small>
+                    `;
+                    usersList.appendChild(userCard);
+                });
+            }
+            
+            function showStatus(message, type) {
+                const statusDiv = document.getElementById('status-message');
+                statusDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+                setTimeout(() => {
+                    statusDiv.innerHTML = '';
+                }, 5000);
+            }
+            
+            // Initial health check
+            setTimeout(() => {
+                checkApiHealth();
+                loadUsers();
+            }, 1000);
+        </script>
+    </body>
+    </html>
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name localhost;
+        
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+            try_files $uri $uri/ /index.html;
+        }
+        
+        # Proxy API requests to backend
+        location /api/ {
+            proxy_pass http://api:8080/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+        
+        # Health check endpoint
+        location /health {
+            return 200 '{"status":"healthy","service":"frontend"}';
+            add_header Content-Type application/json;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo
+  labels:
+    app: frontend
+    tier: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: frontend
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        volumeMounts:
+        - name: frontend-content
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: frontend-content
+        configMap:
+          name: frontend-config
+          items:
+          - key: index.html
+            path: index.html
+      - name: nginx-config
+        configMap:
+          name: frontend-config
+          items:
+          - key: nginx.conf
+            path: default.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo
+  labels:
+    app: frontend
+    tier: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer

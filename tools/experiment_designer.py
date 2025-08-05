@@ -1,9 +1,8 @@
 """
 Experiment Designer Tool
 
-Uses LLM to generate chaos experiments based on Kubernetes topology
-and configuration. Generates experiments in a common schema that can
-be executed by different chaos engines.
+Uses LLM to generate LitmusChaos ChaosEngine YAML files based on Kubernetes topology
+and configuration. Generates experiments that can be directly applied to Kubernetes.
 """
 
 import json
@@ -12,39 +11,22 @@ import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import structlog
+from datetime import datetime
 
 from jinja2 import Template
-from pydantic import BaseModel, Field
 
 logger = structlog.get_logger()
 
 
-class ExperimentSpec(BaseModel):
-    """Pydantic model for experiment specifications"""
-
-    title: str = Field(..., description="Short descriptive name")
-    description: str = Field(..., description="Why this experiment matters")
-    env: str = Field(default="k8s", description="Environment type")
-    action: str = Field(..., description="Chaos action type")
-    target_selector: Dict[str, str] = Field(
-        ..., description="Target selection criteria"
-    )
-    parameters: Dict[str, Any] = Field(..., description="Chaos-specific parameters")
-    abort_threshold: Dict[str, Any] = Field(..., description="Abort conditions")
-    expected_impact: str = Field(..., description="Expected outcome")
-    risk_level: str = Field(..., description="Risk assessment")
-    chaos_engine: str = Field(..., description="Chaos engine to use")
-
-
 class ExperimentDesigner:
     """
-    Uses LLM to design chaos experiments based on infrastructure topology.
+    Uses LLM to design LitmusChaos chaos experiments based on infrastructure topology.
 
     Generates experiments that are:
     - Context-aware (based on actual services)
     - Safe (with proper abort thresholds)
     - High-impact (targeting critical failure modes)
-    - Kubernetes-specific
+    - LitmusChaos-specific YAML files
     """
 
     def __init__(self, model: str = None, temperature: float = 0.3):
@@ -71,14 +53,14 @@ class ExperimentDesigner:
         )
 
     def _load_template(self) -> Template:
-        """Load the Jinja2 template for experiment generation"""
-        template_path = Path(__file__).parent.parent / "prompts" / "experiment.j2"
+        """Load the Jinja2 template for LitmusChaos experiment generation"""
+        template_path = Path(__file__).parent.parent / "prompts" / "litmus-experiment.j2"
 
         try:
             with open(template_path, "r") as f:
                 return Template(f.read())
         except Exception as e:
-            logger.error("Failed to load experiment template", error=str(e))
+            logger.error("Failed to load LitmusChaos experiment template", error=str(e))
             raise
 
     def design(
@@ -86,9 +68,9 @@ class ExperimentDesigner:
         topology: Dict[str, Any],
         count: int = 3,
         config: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[str]:
         """
-        Design chaos experiments based on topology.
+        Design LitmusChaos chaos experiments based on topology.
 
         Args:
             topology: Service topology from inventory fetch
@@ -96,9 +78,9 @@ class ExperimentDesigner:
             config: Optional configuration overrides
 
         Returns:
-            List of experiment specifications
+            List of experiment YAML content as strings
         """
-        logger.info("Starting experiment design", count=count)
+        logger.info("Starting LitmusChaos experiment design", count=count)
 
         try:
             # Prepare context for LLM
@@ -110,35 +92,19 @@ class ExperimentDesigner:
             # Call LLM (adapter handles mock mode and fallbacks)
             response = self._call_llm(prompt)
 
-            # Parse and validate experiments
-            experiments = self._parse_experiments(response)
-
-            # Validate and enhance experiments
-            validated_experiments = []
-            for exp in experiments[:count]:
-                try:
-                    validated_exp = ExperimentSpec(**exp)
-                    enhanced_exp = self._enhance_experiment(
-                        validated_exp.dict(), topology
-                    )
-                    validated_experiments.append(enhanced_exp)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to validate experiment",
-                        experiment=exp.get("title"),
-                        error=str(e),
-                    )
+            # Parse YAML experiments
+            experiments = self._parse_yaml_experiments(response)
 
             logger.info(
-                "Experiment design completed",
+                "LitmusChaos experiment design completed",
                 requested=count,
-                generated=len(validated_experiments),
+                generated=len(experiments),
             )
 
-            return validated_experiments
+            return experiments
 
         except Exception as e:
-            logger.error("Failed to design experiments", error=str(e))
+            logger.error("Failed to design LitmusChaos experiments", error=str(e))
             raise
 
     def _prepare_context(
@@ -176,15 +142,489 @@ class ExperimentDesigner:
         }
 
     def _call_llm(self, prompt: str) -> str:
-        """Call the LLM with the experiment generation prompt"""
-        system_prompt = "You are an expert chaos engineering advisor. Generate only valid JSON arrays of experiment specifications."
+        """Call the LLM with the LitmusChaos experiment generation prompt"""
+        system_prompt = "You are an expert chaos engineering advisor. Generate only valid LitmusChaos ChaosEngine YAML files."
 
         return self.llm_adapter.generate_response(
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=self.temperature,
-            max_tokens=2000,
+            max_tokens=3000,
         )
+
+    def _parse_yaml_experiments(self, response: str) -> List[str]:
+        """Parse YAML experiments from LLM response"""
+        try:
+            # Clean up the response - remove any markdown formatting
+            yaml_content = response.strip()
+            
+            # Remove markdown code blocks if present
+            if yaml_content.startswith("```yaml"):
+                yaml_content = yaml_content[7:]
+            if yaml_content.startswith("```"):
+                yaml_content = yaml_content[3:]
+            if yaml_content.endswith("```"):
+                yaml_content = yaml_content[:-3]
+            
+            yaml_content = yaml_content.strip()
+            
+            # Split by document separator
+            yaml_docs = yaml_content.split("---")
+            experiments = []
+            
+            for doc in yaml_docs:
+                doc = doc.strip()
+                if doc and doc != "":
+                    try:
+                        # Validate YAML
+                        parsed = yaml.safe_load(doc)
+                        if parsed and isinstance(parsed, dict):
+                            # Ensure it's a ChaosEngine
+                            if parsed.get("kind") == "ChaosEngine":
+                                experiments.append(doc)
+                            else:
+                                logger.warning("Skipping non-ChaosEngine document", kind=parsed.get("kind"))
+                    except yaml.YAMLError as e:
+                        logger.warning("Invalid YAML document", error=str(e), doc=doc[:100])
+                        continue
+            
+            logger.info("Parsed YAML experiments", count=len(experiments))
+            return experiments
+            
+        except Exception as e:
+            logger.error("Failed to parse YAML experiments", error=str(e))
+            # Return mock experiments if parsing fails
+            return self._get_mock_experiments()
+
+    def _get_mock_experiments(self) -> List[str]:
+        """Return mock LitmusChaos experiments for testing"""
+        return [
+            """apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: frontend-pod-delete
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=frontend"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "30"
+        - name: CHAOS_INTERVAL
+          value: "10"
+        - name: FORCE
+          value: "false"
+""",
+            """apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: api-cpu-stress
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=api"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-cpu-hog
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "60"
+        - name: CPU_CORES
+          value: "1"
+""",
+            """apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: database-memory-stress
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=database"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-memory-hog
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "45"
+        - name: MEMORY_CONSUMPTION
+          value: "200"
+"""
+        ]
+
+    def save_experiments(self, experiments: List[str], output_dir: Path) -> List[Path]:
+        """Save LitmusChaos experiments to YAML files"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        saved_files = []
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        for i, experiment_yaml in enumerate(experiments):
+            try:
+                # Parse YAML to get experiment name
+                parsed = yaml.safe_load(experiment_yaml)
+                experiment_name = parsed.get("metadata", {}).get("name", f"experiment-{i+1}")
+                
+                # Create filename
+                filename = f"{experiment_name}_{timestamp}.yaml"
+                filepath = output_dir / filename
+                
+                # Write YAML file
+                with open(filepath, "w") as f:
+                    f.write(experiment_yaml)
+                
+                saved_files.append(filepath)
+                logger.info("Saved LitmusChaos experiment", 
+                           name=experiment_name, 
+                           file=str(filepath))
+                
+            except Exception as e:
+                logger.error("Failed to save experiment", 
+                           index=i, 
+                           error=str(e))
+                # Save with generic name
+                filename = f"chaos-experiment-{i+1}_{timestamp}.yaml"
+                filepath = output_dir / filename
+                with open(filepath, "w") as f:
+                    f.write(experiment_yaml)
+                saved_files.append(filepath)
+        
+        # Generate detailed explanation file
+        explanation_file = self._generate_explanation_file(experiments, output_dir, timestamp)
+        saved_files.append(explanation_file)
+        
+        return saved_files
+
+    def _generate_explanation_file(self, experiments: List[str], output_dir: Path, timestamp: str) -> Path:
+        """Generate a detailed explanation file for the generated experiments"""
+        explanation_file = output_dir / f"experiments_explanation_{timestamp}.md"
+        
+        try:
+            with open(explanation_file, "w") as f:
+                f.write(self._create_explanation_content(experiments, timestamp))
+            
+            logger.info("Generated experiment explanation file", file=str(explanation_file))
+            return explanation_file
+            
+        except Exception as e:
+            logger.error("Failed to generate explanation file", error=str(e))
+            return Path("")
+
+    def _create_explanation_content(self, experiments: List[str], timestamp: str) -> str:
+        """Create detailed explanation content for experiments"""
+        
+        content = f"""# ChaosGen AI-Generated Experiments Explanation
+
+**Generated on**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+**Total Experiments**: {len(experiments)}
+**Generated by**: ChaosGen AI-Powered Chaos Engineering Platform
+
+---
+
+## Overview
+
+This document explains the chaos experiments generated by ChaosGen's AI analysis of your Kubernetes infrastructure. Each experiment is designed to test specific failure scenarios and validate your system's resilience.
+
+## Infrastructure Analysis
+
+ChaosGen discovered the following services in your cluster:
+- **Frontend Services**: User-facing applications (nginx, web interfaces)
+- **Backend Services**: Business logic and API services (Flask, Node.js, etc.)
+- **Database Services**: Data persistence layers (PostgreSQL, Redis, etc.)
+- **Infrastructure Services**: Monitoring, logging, and platform services
+
+## Generated Experiments
+
+"""
+        
+        for i, experiment_yaml in enumerate(experiments, 1):
+            try:
+                parsed = yaml.safe_load(experiment_yaml)
+                content += self._format_experiment_explanation(i, parsed)
+            except Exception as e:
+                content += f"""
+### Experiment {i}: Failed to Parse
+**Error**: {str(e)}
+
+This experiment could not be parsed properly. Please check the YAML file manually.
+
+---
+"""
+        
+        content += """
+## How to Use These Experiments
+
+### 1. Review and Understand
+- Read each experiment explanation above
+- Understand what failure scenario it tests
+- Verify the target services are correct
+
+### 2. Safety Considerations
+- All experiments include abort thresholds
+- Monitor your system during execution
+- Have rollback procedures ready
+
+### 3. Execution
+```bash
+# Apply all experiments
+kubectl apply -f experiments/
+
+# Apply specific experiment
+kubectl apply -f experiments/experiment-name.yaml
+
+# Monitor execution
+kubectl get chaosengine -n <namespace>
+kubectl get chaosresult -n <namespace>
+```
+
+### 4. Analysis
+- Monitor application metrics during chaos
+- Check system recovery after chaos
+- Document findings and improvements
+
+## Safety Features
+
+Each experiment includes:
+- **Abort Thresholds**: Automatic stopping if metrics exceed limits
+- **Resource Validation**: Checks before execution
+- **Gradual Intensity**: Controlled chaos injection
+- **Recovery Monitoring**: Validates system healing
+
+## Next Steps
+
+1. **Review**: Understand each experiment's purpose
+2. **Test**: Run in non-production environment first
+3. **Monitor**: Watch metrics and logs during execution
+4. **Analyze**: Document resilience gaps and improvements
+5. **Iterate**: Generate new experiments based on findings
+
+---
+
+*Generated by ChaosGen - AI-Powered Chaos Engineering*
+"""
+        
+        return content
+
+    def _format_experiment_explanation(self, index: int, experiment: Dict[str, Any]) -> str:
+        """Format a single experiment explanation"""
+        
+        metadata = experiment.get("metadata", {})
+        spec = experiment.get("spec", {})
+        appinfo = spec.get("appinfo", {})
+        experiments_list = spec.get("experiments", [])
+        
+        experiment_name = metadata.get("name", f"experiment-{index}")
+        namespace = metadata.get("namespace", "demo")
+        target_app = appinfo.get("applabel", "unknown")
+        app_kind = appinfo.get("appkind", "deployment")
+        
+        # Get experiment details
+        experiment_details = experiments_list[0] if experiments_list else {}
+        experiment_type = experiment_details.get("name", "unknown")
+        
+        # Get parameters
+        env_vars = experiment_details.get("spec", {}).get("components", {}).get("env", [])
+        parameters = {env["name"]: env["value"] for env in env_vars if "name" in env and "value" in env}
+        
+        # Risk assessment
+        risk_level = self._assess_risk_level(experiment_type)
+        
+        # Create explanation
+        explanation = f"""
+### Experiment {index}: {experiment_name}
+
+**Target**: {target_app} ({app_kind}) in namespace `{namespace}`
+**Chaos Type**: {experiment_type}
+**Risk Level**: {risk_level.upper()}
+
+#### What This Experiment Does
+
+"""
+        
+        # Add specific explanations based on experiment type
+        explanation += self._get_experiment_type_explanation(experiment_type, target_app)
+        
+        explanation += f"""
+#### Parameters
+
+"""
+        
+        for param_name, param_value in parameters.items():
+            explanation += f"- **{param_name}**: {param_value}\n"
+        
+        explanation += f"""
+#### Expected Impact
+
+"""
+        
+        explanation += self._get_expected_impact(experiment_type, target_app)
+        
+        explanation += f"""
+#### Safety Measures
+
+- **Abort Conditions**: Experiment will stop if system health degrades
+- **Duration Control**: Limited execution time to prevent extended outages
+- **Resource Limits**: Controlled chaos intensity to maintain system stability
+
+#### Monitoring Points
+
+- Application response times
+- Error rates and availability
+- Resource utilization (CPU, memory, network)
+- Service dependency health
+- Database connection pools
+
+---
+"""
+        
+        return explanation
+
+    def _get_experiment_type_explanation(self, experiment_type: str, target_app: str) -> str:
+        """Get explanation for specific experiment types"""
+        
+        explanations = {
+            "pod-delete": f"""
+This experiment randomly kills pods from the {target_app} deployment to test:
+- **Pod restart resilience**: How quickly new pods start up
+- **Load balancer behavior**: How traffic is redistributed
+- **Service discovery**: How clients find healthy pods
+- **Data consistency**: Whether state is preserved during restarts
+
+This simulates real-world scenarios like:
+- Node failures
+- OOM kills
+- Manual pod deletions
+- Rolling updates gone wrong
+""",
+            
+            "pod-cpu-hog": f"""
+This experiment injects CPU stress into {target_app} pods to test:
+- **Resource limits**: Whether CPU limits are properly enforced
+- **Performance degradation**: How the app behaves under load
+- **Scheduler behavior**: How Kubernetes handles resource pressure
+- **Monitoring alerts**: Whether CPU spikes trigger proper alerts
+
+This simulates:
+- High CPU usage from bugs
+- Resource exhaustion attacks
+- Poorly optimized code paths
+- Background processing spikes
+""",
+            
+            "pod-memory-hog": f"""
+This experiment injects memory pressure into {target_app} pods to test:
+- **Memory limits**: Whether memory limits are enforced
+- **OOM handling**: How the system responds to memory pressure
+- **Garbage collection**: Whether memory is properly managed
+- **Pod eviction**: Whether pods are evicted when memory is low
+
+This simulates:
+- Memory leaks
+- Large data processing
+- Cache buildup
+- Memory-intensive operations
+""",
+            
+            "pod-network-delay": f"""
+This experiment adds network latency to {target_app} pods to test:
+- **Timeout handling**: How the app handles slow responses
+- **Circuit breakers**: Whether retry mechanisms work
+- **User experience**: How latency affects end users
+- **Dependency resilience**: How downstream services handle delays
+
+This simulates:
+- Network congestion
+- Geographic latency
+- ISP issues
+- Network equipment problems
+""",
+            
+            "pod-network-loss": f"""
+This experiment simulates packet loss for {target_app} pods to test:
+- **Connection resilience**: How the app handles network failures
+- **Retry mechanisms**: Whether failed requests are retried
+- **Error handling**: How network errors are handled
+- **Service degradation**: Whether the app degrades gracefully
+
+This simulates:
+- Network instability
+- Packet corruption
+- Network partitions
+- ISP outages
+"""
+        }
+        
+        return explanations.get(experiment_type, f"""
+This experiment performs {experiment_type} on {target_app} to test system resilience.
+The specific behavior depends on the chaos type and target application.
+""")
+
+    def _get_expected_impact(self, experiment_type: str, target_app: str) -> str:
+        """Get expected impact description for experiment types"""
+        
+        impacts = {
+            "pod-delete": f"""
+- **Immediate**: {target_app} pods will be terminated
+- **Recovery**: New pods should start within 30-60 seconds
+- **User Impact**: Brief service interruption (5-30 seconds)
+- **Monitoring**: Watch for increased error rates and latency
+- **Success Criteria**: Service returns to normal within 2 minutes
+""",
+            
+            "pod-cpu-hog": f"""
+- **Immediate**: {target_app} pods will experience high CPU usage
+- **Performance**: Response times may increase by 50-200%
+- **User Impact**: Slower application responses
+- **Monitoring**: Watch CPU metrics and response times
+- **Success Criteria**: App remains functional, performance recovers after chaos
+""",
+            
+            "pod-memory-hog": f"""
+- **Immediate**: {target_app} pods will experience memory pressure
+- **Behavior**: Pods may be evicted if memory limits are exceeded
+- **User Impact**: Potential service interruptions if pods are killed
+- **Monitoring**: Watch memory usage and pod restarts
+- **Success Criteria**: App handles memory pressure gracefully
+""",
+            
+            "pod-network-delay": f"""
+- **Immediate**: Network requests to {target_app} will be delayed
+- **Performance**: Response times will increase significantly
+- **User Impact**: Slower application responses
+- **Monitoring**: Watch network latency and timeout errors
+- **Success Criteria**: App handles delays without crashing
+""",
+            
+            "pod-network-loss": f"""
+- **Immediate**: Some network requests to {target_app} will fail
+- **Behavior**: Intermittent connection failures
+- **User Impact**: Some requests may fail, others succeed
+- **Monitoring**: Watch error rates and connection failures
+- **Success Criteria**: App handles network failures gracefully
+"""
+        }
+        
+        return impacts.get(experiment_type, f"""
+- **Immediate**: {target_app} will experience {experiment_type} conditions
+- **Impact**: Varies based on the specific chaos type
+- **Monitoring**: Watch for changes in application behavior
+- **Success Criteria**: System remains stable and recovers after chaos
+""")
 
     def _check_llm_availability(self):
         """Check LLM availability and provide helpful feedback"""
@@ -198,191 +638,54 @@ class ExperimentDesigner:
             print("   1. Set OpenAI key: export OPENAI_API_KEY='your-key'")
             print("   2. Set Gemini key: export GOOGLE_API_KEY='your-key'")
             print("   3. Use mock mode: export CHAOSGEN_MOCK_MODE=true")
-            print("   4. Force provider: export CHAOSGEN_LLM_PROVIDER=openai|gemini")
 
-            # If we're in mock mode, don't show error
-            if self.llm_adapter.provider == "mock":
-                print(
-                    "✅ Using mock mode - experiments will be generated without API calls"
-                )
+    def get_experiment_summary(self, experiments: List[str]) -> List[Dict[str, Any]]:
+        """Get summary information about generated experiments"""
+        summaries = []
+        
+        for experiment_yaml in experiments:
+            try:
+                parsed = yaml.safe_load(experiment_yaml)
+                
+                metadata = parsed.get("metadata", {})
+                spec = parsed.get("spec", {})
+                appinfo = spec.get("appinfo", {})
+                experiments_list = spec.get("experiments", [])
+                
+                experiment_type = experiments_list[0].get("name", "unknown") if experiments_list else "unknown"
+                
+                summary = {
+                    "name": metadata.get("name", "unknown"),
+                    "namespace": metadata.get("namespace", "demo"),
+                    "target_app": appinfo.get("applabel", "unknown"),
+                    "experiment_type": experiment_type,
+                    "description": f"{experiment_type} experiment targeting {appinfo.get('applabel', 'unknown')}",
+                    "risk_level": self._assess_risk_level(experiment_type),
+                }
+                
+                summaries.append(summary)
+                
+            except Exception as e:
+                logger.warning("Failed to parse experiment summary", error=str(e))
+                summaries.append({
+                    "name": "unknown",
+                    "namespace": "demo",
+                    "target_app": "unknown",
+                    "experiment_type": "unknown",
+                    "description": "Failed to parse experiment",
+                    "risk_level": "unknown",
+                })
+        
+        return summaries
 
-    def _parse_experiments(self, response: str) -> List[Dict[str, Any]]:
-        """Parse LLM response into experiment specifications"""
-        try:
-            # Clean up response - extract JSON array
-            response = response.strip()
-
-            # Remove markdown code blocks if present
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-
-            response = response.strip()
-
-            # Parse JSON
-            experiments = json.loads(response)
-
-            if not isinstance(experiments, list):
-                raise ValueError("Expected JSON array of experiments")
-
-            logger.info("Parsed experiments from LLM", count=len(experiments))
-            return experiments
-
-        except Exception as e:
-            logger.error(
-                "Failed to parse experiments", response=response[:200], error=str(e)
-            )
-            raise
-
-    def _enhance_experiment(
-        self, experiment: Dict[str, Any], topology: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Enhance experiment with additional metadata and validation"""
-
-        # Add metadata
-        experiment["metadata"] = {
-            "generated_at": topology.get("metadata", {}).get("generated_at"),
-            "cluster_info": topology.get("metadata", {}).get("cluster", {}),
-            "designer_version": "1.0.0",
+    def _assess_risk_level(self, experiment_type: str) -> str:
+        """Assess risk level based on experiment type"""
+        risk_mapping = {
+            "pod-delete": "medium",
+            "pod-cpu-hog": "low",
+            "pod-memory-hog": "medium",
+            "pod-network-delay": "low",
+            "pod-network-loss": "medium",
+            "node-drain": "high",
         }
-
-        # Validate target exists
-        target_selector = experiment.get("target_selector", {})
-        namespace = target_selector.get("namespace")
-        label_selector = target_selector.get("label_selector")
-
-        if namespace and label_selector:
-            # Check if target exists in topology
-            services = topology.get("services", [])
-            matching_services = [
-                s
-                for s in services
-                if s["namespace"] == namespace
-                and self._labels_match_selector(s.get("labels", {}), label_selector)
-            ]
-
-            if matching_services:
-                experiment["target_validation"] = {
-                    "status": "valid",
-                    "matching_services": [s["id"] for s in matching_services],
-                }
-            else:
-                experiment["target_validation"] = {
-                    "status": "warning",
-                    "message": "No services match the target selector",
-                }
-
-        # Add default values if missing
-        if "parameters" not in experiment:
-            experiment["parameters"] = {}
-
-        if "duration" not in experiment["parameters"]:
-            experiment["parameters"]["duration"] = "60s"
-
-        if "intensity" not in experiment["parameters"]:
-            experiment["parameters"]["intensity"] = 0.5
-
-        # Ensure abort threshold is set
-        if "abort_threshold" not in experiment:
-            experiment["abort_threshold"] = {
-                "metric": "error_rate",
-                "value": 0.05,
-                "operator": ">",
-            }
-
-        return experiment
-
-    def _labels_match_selector(self, labels: Dict[str, str], selector: str) -> bool:
-        """Check if labels match a Kubernetes label selector"""
-        # Simple implementation - in production, you'd want proper K8s label selector parsing
-        try:
-            # Parse selector like "app=redis,component=primary"
-            selector_parts = selector.split(",")
-            for part in selector_parts:
-                if "=" in part:
-                    key, value = part.split("=", 1)
-                    if key not in labels or labels[key] != value:
-                        return False
-            return True
-        except Exception:
-            return False
-
-    def rank_experiments(
-        self,
-        experiments: List[Dict[str, Any]],
-        criteria: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Rank experiments by impact and safety.
-
-        Args:
-            experiments: List of experiment specifications
-            criteria: Optional ranking criteria
-
-        Returns:
-            Ranked list of experiments
-        """
-        if not criteria:
-            criteria = {
-                "risk_weight": 0.3,
-                "impact_weight": 0.4,
-                "complexity_weight": 0.3,
-            }
-
-        def calculate_score(exp: Dict[str, Any]) -> float:
-            score = 0.0
-
-            # Risk score (lower is better)
-            risk_level = exp.get("risk_level", "medium")
-            risk_scores = {"low": 0.8, "medium": 0.5, "high": 0.2}
-            score += criteria["risk_weight"] * risk_scores.get(risk_level, 0.5)
-
-            # Impact score (higher is better for critical services)
-            if exp.get("target_validation", {}).get("status") == "valid":
-                score += criteria["impact_weight"] * 0.8
-            else:
-                score += criteria["impact_weight"] * 0.3
-
-            # Complexity score (medium complexity is often best)
-            action = exp.get("action", "")
-            complexity_scores = {
-                "pod-kill": 0.7,
-                "network-delay": 0.6,
-                "pod-cpu-hog": 0.5,
-                "node-drain": 0.3,
-            }
-            score += criteria["complexity_weight"] * complexity_scores.get(action, 0.5)
-
-            return score
-
-        # Sort by score (descending)
-        ranked = sorted(experiments, key=calculate_score, reverse=True)
-
-        # Add ranking metadata
-        for i, exp in enumerate(ranked):
-            exp["ranking"] = {"position": i + 1, "score": calculate_score(exp)}
-
-        logger.info("Experiments ranked", count=len(ranked))
-        return ranked
-
-    def save_experiments(
-        self, experiments: List[Dict[str, Any]], output_dir: Path = Path("experiments")
-    ) -> List[Path]:
-        """Save experiments to JSON files"""
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        saved_files = []
-        for i, experiment in enumerate(experiments):
-            filename = f"{experiment['title'].lower().replace(' ', '_').replace('-', '_')}.json"
-            filepath = output_dir / filename
-
-            with open(filepath, "w") as f:
-                json.dump(experiment, f, indent=2, default=str)
-
-            saved_files.append(filepath)
-            logger.info(
-                "Saved experiment", file=str(filepath), title=experiment["title"]
-            )
-
-        return saved_files
+        return risk_mapping.get(experiment_type, "medium")

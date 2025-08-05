@@ -335,35 +335,74 @@ class LLMAdapter:
     def _generate_mock_response(self, prompt: str) -> str:
         """Generate a mock response for testing"""
 
-        # Simple mock response that looks like experiment JSON
-        mock_experiments = [
-            {
-                "title": "Mock Pod Kill Experiment",
-                "description": "Test pod restart resilience",
-                "env": "k8s",
-                "action": "pod-kill",
-                "target_selector": {
-                    "namespace": "default",
-                    "label_selector": "app=mock-app",
-                    "resource_type": "deployment",
-                },
-                "parameters": {
-                    "duration": "60s",
-                    "intensity": 0.5,
-                    "replicas_to_kill": 1,
-                },
-                "abort_threshold": {
-                    "metric": "error_rate",
-                    "value": 0.05,
-                    "operator": ">",
-                },
-                "expected_impact": "Service may experience brief interruptions",
-                "risk_level": "medium",
-                "chaos_engine": "litmuschaos",
-            }
-        ]
+        # Return mock LitmusChaos YAML experiments
+        mock_yaml = """apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: frontend-pod-delete
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=frontend"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-delete
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "30"
+        - name: CHAOS_INTERVAL
+          value: "10"
+        - name: FORCE
+          value: "false"
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: api-cpu-stress
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=api"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-cpu-hog
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "60"
+        - name: CPU_CORES
+          value: "1"
+---
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: database-memory-stress
+  namespace: demo
+spec:
+  appinfo:
+    appns: demo
+    applabel: "app=database"
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+  - name: pod-memory-hog
+    spec:
+      components:
+        env:
+        - name: TOTAL_CHAOS_DURATION
+          value: "45"
+        - name: MEMORY_CONSUMPTION
+          value: "200"
+"""
 
-        return json.dumps(mock_experiments, indent=2)
+        return mock_yaml
 
     def check_availability(self) -> Dict[str, Any]:
         """Check if the configured provider is available and working"""
